@@ -1,33 +1,32 @@
-# pi-ac — Adaptive Compaction for Pi
+# pi-ac: adaptive compaction for Pi
 
-A Pi extension for automatic compaction during long-running work. It keeps the familiar slash-command workflow, uses Pi's standard compaction summary, and resumes an interrupted task automatically.
+A Pi extension that starts native compaction early during long-running tasks. It uses Pi's default summary and resumes a task if compaction interrupts it.
 
-## What it does
+## Behavior
 
-- Watches context growth at completed turns.
-- Uses an adaptive target (80% by default), adjusted by recent turn growth and bounded by Pi's effective per-model `reserveTokens` threshold.
-- Calls Pi's native compaction with its default summary; it does not create virtual summary blocks or modify context projection.
-- If compaction interrupts active work, queues one continuation after compaction. It does not add a continuation when no task was interrupted.
-- Leaves completed turns, queued messages, and an already-crossed Pi threshold to Pi.
+- Checks context after each completed turn.
+- Uses an 80% target by default, capped by Pi's native threshold (`contextWindow - reserveTokens`).
+- Estimates next-turn growth from the last five observed context increases.
+- Triggers only when the turn can continue and no messages are queued. Pi handles completed turns and an already-crossed native threshold.
+- Uses Pi's default summary. If `/ac compact` interrupts an active task, pi-ac queues one continuation. It does not add a prompt when Pi is idle.
 
 ## Commands
 
 | Command | Action |
 |---|---|
 | `/ac` or `/ac help` | Show commands and status |
-| `/ac status` | Show usage, target, Pi threshold, growth forecast, and last compression |
-| `/ac compress [focus]` | Run Pi's compaction; resume an interrupted task |
+| `/ac status` | Show usage, target, Pi threshold, growth forecast, and last compaction |
+| `/ac compact [focus]` | Run Pi's compaction; resume an interrupted task |
 | `/ac threshold <1-100\|off>` | Set this session's adaptive target; `off` uses growth forecasting against Pi's threshold |
 | `/ac enable` / `/ac disable` | Enable or disable proactive compaction for this session |
-| `/ac config` | Show effective Pi compaction settings |
 
-There is no `/ac compact` command. pi-ac has no DCP-style range compressor, pruning, custom summary format, stats store, footer, or statusline.
+pi-ac does not prune messages or add a footer or statusline.
 
 ## Threshold behavior
 
-The effective trigger is bounded by both the target percentage and Pi's own threshold (`contextWindow - reserveTokens`). Recent growth over the last five completed turns can move the trigger earlier when the next turn is likely to cross that limit. `PI_AC_TARGET_PERCENT` sets the default target; `/ac threshold` changes it for the current session.
+At each turn end, pi-ac adds its growth estimate to the current context size and compares the result with the lower of the percentage target and Pi's native threshold. The estimate uses the last five observed increases. `/ac threshold` changes the percentage for this session; `off` uses only Pi's threshold.
 
-Pi's normal settings remain in control of the native ceiling and retained history:
+Pi settings control the native threshold and how much history it keeps:
 
 ```json
 {

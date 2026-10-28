@@ -111,14 +111,15 @@ describe("pi-ac lifecycle", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("registers the /ac interface without a compact command", () => {
+  it("shows the /ac command interface", () => {
     const { ctx, command } = harness();
-    command("compact");
+    command("help");
     expect(ctx.compact).not.toHaveBeenCalled();
     const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
     expect(messages).toContain("/ac status");
-    expect(messages).toContain("/ac compress");
-    expect(messages).not.toContain("/ac compact");
+    expect(messages).toContain("/ac compact");
+    expect(messages).toContain("/ac threshold");
+    expect(messages).toContain("/ac enable | disable");
   });
 
   it("sets the adaptive threshold through /ac threshold", () => {
@@ -141,16 +142,16 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
-  it("compresses with Pi's default and resumes only an interrupted task", () => {
+  it("compacts with Pi's default and resumes only an interrupted task", () => {
     const active = harness();
     active.ctx.isIdle.mockReturnValue(false);
-    active.command("compress keep the current plan");
+    active.command("compact keep the current plan");
     expect(active.ctx.compact.mock.calls[0][0].customInstructions).toBe("keep the current plan");
     active.completeCompact();
     expect(active.pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
     const idle = harness();
-    idle.command("compress");
+    idle.command("compact");
     idle.completeCompact();
     expect(idle.pi.sendUserMessage).not.toHaveBeenCalled();
   });

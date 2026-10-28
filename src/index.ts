@@ -9,10 +9,10 @@ import {
 } from "./policy.ts";
 
 const RESUME_PROMPT = "Continue the current task from the compacted context. Do not repeat completed work.";
-type CompressionSource = "automatic" | "command" | "Pi";
+type CompactionSource = "automatic" | "command" | "Pi";
 
-interface LastCompression {
-  source: CompressionSource;
+interface LastCompaction {
+  source: CompactionSource;
   tokensBefore: number;
 }
 
@@ -22,10 +22,9 @@ export default function piAc(pi: ExtensionAPI): void {
   let compacting = false;
   let stoppedAfterError = false;
   let compactionWasAborted = false;
-  let compressionSource: CompressionSource | null = null;
-  let lastCompression: LastCompression | undefined;
-  const defaultTargetPercent = readTargetPercent();
-  let targetPercent: number | null = defaultTargetPercent;
+  let compactionSource: CompactionSource | null = null;
+  let lastCompaction: LastCompaction | undefined;
+  let targetPercent: number | null = DEFAULT_TARGET_PERCENT;
 
   pi.registerCommand("ac", {
     description: "Automatic compaction controls",
@@ -38,15 +37,15 @@ export default function piAc(pi: ExtensionAPI): void {
     compacting = false;
     stoppedAfterError = false;
     compactionWasAborted = false;
-    compressionSource = null;
-    lastCompression = undefined;
-    targetPercent = defaultTargetPercent;
+    compactionSource = null;
+    lastCompaction = undefined;
+    targetPercent = DEFAULT_TARGET_PERCENT;
   });
 
   pi.on("session_compact", (event) => {
     growth = createGrowthHistory();
-    lastCompression = {
-      source: compressionSource ?? "Pi",
+    lastCompaction = {
+      source: compactionSource ?? "Pi",
       tokensBefore: event.compactionEntry.tokensBefore,
     };
   });
@@ -87,7 +86,7 @@ export default function piAc(pi: ExtensionAPI): void {
       return;
     }
 
-    startCompression(ctx, { source: "automatic", resume: true });
+    startCompaction(ctx, { source: "automatic", resume: true });
   });
 
   function handleCommand(args: string, ctx: ExtensionCommandContext): void {
@@ -116,16 +115,13 @@ export default function piAc(pi: ExtensionAPI): void {
         autoEnabled = false;
         report(ctx, "Automatic compaction disabled. Pi's native compaction remains available.");
         return;
-      case "compress":
+      case "compact":
         if (compacting) return;
-        startCompression(ctx, {
+        startCompaction(ctx, {
           source: "command",
           resume: !ctx.isIdle(),
           customInstructions: value || undefined,
         });
-        return;
-      case "config":
-        showConfig(ctx);
         return;
       default:
         report(ctx, `Unknown /ac command: ${subcommand}`, "warning");
@@ -152,21 +148,21 @@ export default function piAc(pi: ExtensionAPI): void {
     report(ctx, `Adaptive compaction target set to ${parsed}% for this session.`);
   }
 
-  function startCompression(
+  function startCompaction(
     ctx: ExtensionContext,
-    options: { source: Exclude<CompressionSource, "Pi">; resume: boolean; customInstructions?: string },
+    options: { source: Exclude<CompactionSource, "Pi">; resume: boolean; customInstructions?: string },
   ): void {
     if (compacting) return;
     compacting = true;
     compactionWasAborted = false;
-    compressionSource = options.source;
+    compactionSource = options.source;
     let finished = false;
 
     const finish = (success: boolean) => {
       if (finished) return;
       finished = true;
       compacting = false;
-      compressionSource = null;
+      compactionSource = null;
       growth = createGrowthHistory();
       if (!success) stoppedAfterError = true;
       if (options.resume && !compactionWasAborted) pi.sendUserMessage(RESUME_PROMPT);
@@ -198,10 +194,9 @@ export default function piAc(pi: ExtensionAPI): void {
       ctx,
       [
         "/ac status                 Show context and adaptive threshold",
-        "/ac compress [focus]       Run Pi's compaction; resume an interrupted task",
+        "/ac compact [focus]        Run Pi's compaction; resume an interrupted task",
         "/ac threshold <1-100|off>  Set this session's adaptive target",
         "/ac enable | disable        Toggle proactive compaction",
-        "/ac config                 Show Pi's effective compaction settings",
         "/ac help                   Show these commands",
       ].join("\n"),
     );
@@ -227,25 +222,11 @@ export default function piAc(pi: ExtensionAPI): void {
       lines.push(`recent growth forecast: ~${formatTokens(estimateNextTurnGrowth(growth))}`);
     }
     lines.push(`Pi auto-compaction: ${policy.enabled ? "enabled" : "disabled"}`);
-    if (compacting) lines.push("compression: running");
-    if (lastCompression) {
-      lines.push(`last compression: ${lastCompression.source} · ~${formatTokens(lastCompression.tokensBefore)} before`);
+    if (compacting) lines.push("compaction: running");
+    if (lastCompaction) {
+      lines.push(`last compaction: ${lastCompaction.source} · ~${formatTokens(lastCompaction.tokensBefore)} before`);
     }
     report(ctx, lines.join("\n"));
-  }
-
-  function showConfig(ctx: ExtensionCommandContext): void {
-    const policy = getCompactionPolicy(ctx);
-    report(
-      ctx,
-      [
-        `Pi automatic compaction: ${policy.enabled ? "enabled" : "disabled"}`,
-        `Pi reserve tokens: ${formatTokens(policy.reserveTokens)}`,
-        `Adaptive target: ${targetPercent === null ? "off" : `${targetPercent}%`} (session only)`,
-        "Summary: Pi default",
-        "Resume: automatic after an interrupted active task",
-      ].join("\n"),
-    );
   }
 }
 
@@ -258,9 +239,4 @@ function formatTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens % 1_000 === 0 ? 0 : 1)}K`;
   return String(tokens);
-}
-
-function readTargetPercent(): number {
-  const value = Number(process.env.PI_AC_TARGET_PERCENT ?? DEFAULT_TARGET_PERCENT);
-  return Number.isFinite(value) && value > 0 && value <= 100 ? value : DEFAULT_TARGET_PERCENT;
 }
