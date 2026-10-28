@@ -1,0 +1,30 @@
+{
+  "name": "pi-ac",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Adaptive automatic compaction for Pi",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hypernewbie/pi-ac.git"
+  },
+  "homepage": "https://github.com/hypernewbie/pi-ac",
+  "keywords": ["pi-package", "compaction", "context"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": ["src/", "README.md", "LICENSE"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "typecheck": "tsc --noEmit"
+  }
+}
