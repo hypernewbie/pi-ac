@@ -34,16 +34,19 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     }),
     hasUI: true,
     isIdle: vi.fn(() => true),
+    hasPendingMessages: vi.fn(() => false),
     ui: { notify: vi.fn() },
   };
   piAc(pi);
 
-  const turn = (nextTokens: number, canContinue = true, pendingMessages: unknown[] = []) => {
+  const turn = (
+    nextTokens: number,
+    canContinue = true,
+    pendingMessages: unknown[] = [],
+    outcome: "completed" | "aborted" | "error" = "completed",
+  ) => {
     tokens = nextTokens;
-    handlers.turn_end(
-      { context: { canContinue, pendingMessages } },
-      ctx,
-    );
+    handlers.turn_end({ context: { canContinue, pendingMessages }, outcome }, ctx);
   };
 
   return {
@@ -51,11 +54,18 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     ctx,
     turn,
     command: (args: string) => commandHandler?.(args, ctx),
+    startSession: () => handlers.session_start({}, ctx),
+    startRun: () => handlers.agent_start({}, ctx),
+    settle: (aborted = false) => handlers.agent_settled({ aborted }, ctx),
+    noteCompaction: () => handlers.session_compact({ compactionEntry: { tokensBefore: tokens } }, ctx),
     failCompact: (aborted = false) => {
       handlers.session_compact_failed({ reason: "manual", aborted }, ctx);
       compactOptions?.onError?.(new Error("compaction error"));
     },
-    completeCompact: () => compactOptions?.onComplete?.({}),
+    completeCompact: () => {
+      handlers.session_compact({ compactionEntry: { tokensBefore: tokens } }, ctx);
+      compactOptions?.onComplete?.({});
+    },
   };
 }
 
@@ -119,7 +129,120 @@ describe("pi-ac lifecycle", () => {
     expect(messages).toContain("/ac status");
     expect(messages).toContain("/ac compact");
     expect(messages).toContain("/ac threshold");
+    expect(messages).toContain("/ac end-turn");
     expect(messages).toContain("/ac enable | disable");
+
+    command("end-turn 80%");
+    command("status");
+    const status = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(status).toContain("end-of-turn compaction: 80% of context window (~80K)");
+  });
+
+  it("can disable and resets the end-of-turn threshold per session", () => {
+    const { ctx, command, startSession } = harness();
+    command("end-turn 120000");
+    command("end-turn off");
+    command("status");
+    let status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
+    expect(status).toContain("end-of-turn compaction: off");
+
+    command("end-turn 120000");
+    startSession();
+    command("status");
+    status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
+    expect(status).toContain("end-of-turn compaction: off");
+  });
+
+  it("compacts a completed run at an absolute end-of-turn threshold without resuming", async () => {
+    const { pi, ctx, command, startRun, turn, settle, completeCompact } = harness();
+    command("end-turn 70000");
+    startRun();
+    turn(40_000);
+    turn(75_000, false);
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    const settling = settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    completeCompact();
+    await settling;
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses a percentage of the current context window at settlement", async () => {
+    const { ctx, command, startRun, turn, settle, completeCompact } = harness();
+    command("end-turn 75%");
+    startRun();
+    turn(75_000, false);
+    const settling = settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    completeCompact();
+    await settling;
+  });
+
+  it("keeps end-of-turn compaction opt-in and skips aborted or already-compacted runs", async () => {
+    const disabledByDefault = harness();
+    disabledByDefault.startRun();
+    disabledByDefault.turn(90_000, false);
+    await disabledByDefault.settle();
+    expect(disabledByDefault.ctx.compact).not.toHaveBeenCalled();
+
+    const aborted = harness();
+    aborted.command("end-turn 80%");
+    aborted.startRun();
+    aborted.turn(90_000, false, [], "aborted");
+    await aborted.settle(true);
+    expect(aborted.ctx.compact).not.toHaveBeenCalled();
+
+    const failed = harness();
+    failed.command("end-turn 80%");
+    failed.startRun();
+    failed.turn(90_000, false, [], "error");
+    await failed.settle();
+    expect(failed.ctx.compact).not.toHaveBeenCalled();
+
+    const alreadyCompacted = harness();
+    alreadyCompacted.command("end-turn 80%");
+    alreadyCompacted.startRun();
+    alreadyCompacted.turn(90_000, false);
+    alreadyCompacted.noteCompaction();
+    await alreadyCompacted.settle();
+    expect(alreadyCompacted.ctx.compact).not.toHaveBeenCalled();
+
+    const compactedThenContinued = harness();
+    compactedThenContinued.command("end-turn 80%");
+    compactedThenContinued.startRun();
+    compactedThenContinued.turn(60_000, false);
+    compactedThenContinued.noteCompaction();
+    compactedThenContinued.turn(90_000, false);
+    const settling = compactedThenContinued.settle();
+    expect(compactedThenContinued.ctx.compact).toHaveBeenCalledTimes(1);
+    compactedThenContinued.completeCompact();
+    await settling;
+
+    const queued = harness();
+    queued.command("end-turn 80%");
+    queued.ctx.hasPendingMessages.mockReturnValue(true);
+    queued.startRun();
+    queued.turn(90_000, false);
+    await queued.settle();
+    expect(queued.ctx.compact).not.toHaveBeenCalled();
+
+    const piDisabled = harness({ enabled: false });
+    piDisabled.command("end-turn 80%");
+    piDisabled.startRun();
+    piDisabled.turn(90_000, false);
+    await piDisabled.settle();
+    expect(piDisabled.ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("disables end-of-turn compaction with /ac disable", async () => {
+    const { ctx, command, startRun, turn, settle } = harness();
+    command("end-turn 70%");
+    command("disable");
+    startRun();
+    turn(80_000, false);
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
   });
 
   it("sets the adaptive threshold through /ac threshold", () => {

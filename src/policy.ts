@@ -8,6 +8,10 @@ export interface CompactionPolicy {
   reserveTokens: number;
 }
 
+export type EndOfTurnThreshold =
+  | { unit: "tokens"; value: number }
+  | { unit: "percent"; value: number };
+
 export const DEFAULT_TARGET_PERCENT = 80;
 const MAX_GROWTH_SAMPLES = 5;
 
@@ -30,6 +34,48 @@ export function estimateNextTurnGrowth(history: GrowthHistory): number {
   const sorted = [...history.deltas].sort((a, b) => a - b);
   const p90Index = Math.ceil(sorted.length * 0.9) - 1;
   return sorted[Math.max(0, p90Index)] ?? 0;
+}
+
+/** Parse an end-of-turn token or percentage threshold. Undefined means invalid; null means off. */
+export function parseEndOfTurnThreshold(value: string): EndOfTurnThreshold | null | undefined {
+  const input = value.trim().toLowerCase();
+  if (input === "off") return null;
+
+  if (/^\d+$/.test(input)) {
+    const tokens = Number(input);
+    return Number.isSafeInteger(tokens) && tokens > 0 ? { unit: "tokens", value: tokens } : undefined;
+  }
+
+  const percentMatch = /^(\d+(?:\.\d+)?)%$/.exec(input);
+  if (percentMatch) {
+    const percent = Number(percentMatch[1]);
+    return Number.isFinite(percent) && percent > 0 && percent <= 100
+      ? { unit: "percent", value: percent }
+      : undefined;
+  }
+
+  return undefined;
+}
+
+/** Whether completed context has reached an independent end-of-turn threshold. */
+export function shouldCompactAtEndOfTurn(
+  tokens: number,
+  contextWindow: number,
+  threshold: EndOfTurnThreshold | null,
+): boolean {
+  if (
+    threshold === null ||
+    !Number.isFinite(tokens) ||
+    tokens < 0 ||
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0
+  ) return false;
+
+  if (threshold.unit === "tokens") {
+    return Number.isSafeInteger(threshold.value) && threshold.value > 0 && tokens >= threshold.value;
+  }
+  if (!Number.isFinite(threshold.value) || threshold.value <= 0 || threshold.value > 100) return false;
+  return tokens >= Math.floor((contextWindow * threshold.value) / 100);
 }
 
 /**

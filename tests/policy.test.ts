@@ -3,7 +3,9 @@ import {
   createGrowthHistory,
   estimateNextTurnGrowth,
   observeTokens,
+  parseEndOfTurnThreshold,
   shouldAutoCompact,
+  shouldCompactAtEndOfTurn,
 } from "../src/policy.ts";
 
 const policy = { enabled: true, reserveTokens: 16_384 };
@@ -28,6 +30,29 @@ describe("turn-growth forecast", () => {
     const history = createGrowthHistory();
     for (let i = 0; i < 8; i++) observeTokens(history, i * 10_000);
     expect(history.deltas).toEqual([10_000, 10_000, 10_000, 10_000, 10_000]);
+  });
+});
+
+describe("end-of-turn threshold", () => {
+  it("parses absolute tokens, percentages, and off", () => {
+    expect(parseEndOfTurnThreshold("120000")).toEqual({ unit: "tokens", value: 120_000 });
+    expect(parseEndOfTurnThreshold("75.5%")).toEqual({ unit: "percent", value: 75.5 });
+    expect(parseEndOfTurnThreshold("off")).toBeNull();
+  });
+
+  it("rejects invalid thresholds", () => {
+    expect(parseEndOfTurnThreshold("0")).toBeUndefined();
+    expect(parseEndOfTurnThreshold("101%")).toBeUndefined();
+    expect(parseEndOfTurnThreshold("9007199254740992")).toBeUndefined();
+    expect(parseEndOfTurnThreshold("75 %")).toBeUndefined();
+  });
+
+  it("checks absolute and percentage thresholds against completed context", () => {
+    expect(shouldCompactAtEndOfTurn(80_000, 100_000, { unit: "tokens", value: 80_000 })).toBe(true);
+    expect(shouldCompactAtEndOfTurn(79_999, 100_000, { unit: "tokens", value: 80_000 })).toBe(false);
+    expect(shouldCompactAtEndOfTurn(75_500, 100_000, { unit: "percent", value: 75.5 })).toBe(true);
+    expect(shouldCompactAtEndOfTurn(75_499, 100_000, { unit: "percent", value: 75.5 })).toBe(false);
+    expect(shouldCompactAtEndOfTurn(90_000, 100_000, null)).toBe(false);
   });
 });
 

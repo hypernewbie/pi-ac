@@ -5,11 +5,14 @@ import {
   DEFAULT_TARGET_PERCENT,
   estimateNextTurnGrowth,
   observeTokens,
+  parseEndOfTurnThreshold,
   shouldAutoCompact,
+  shouldCompactAtEndOfTurn,
+  type EndOfTurnThreshold,
 } from "./policy.ts";
 
 const RESUME_PROMPT = "Continue the current task from the compacted context. Do not repeat completed work.";
-type CompactionSource = "automatic" | "command" | "Pi";
+type CompactionSource = "automatic" | "command" | "end-of-turn" | "Pi";
 
 interface LastCompaction {
   source: CompactionSource;
@@ -25,6 +28,10 @@ export default function piAc(pi: ExtensionAPI): void {
   let compactionSource: CompactionSource | null = null;
   let lastCompaction: LastCompaction | undefined;
   let targetPercent: number | null = DEFAULT_TARGET_PERCENT;
+  let endOfTurnThreshold: EndOfTurnThreshold | null = null;
+  let agentRunActive = false;
+  let compactedAfterLastTurn = false;
+  let lastTurnOutcome: "completed" | "aborted" | "error" | null = null;
 
   pi.registerCommand("ac", {
     description: "Automatic compaction controls",
@@ -40,9 +47,50 @@ export default function piAc(pi: ExtensionAPI): void {
     compactionSource = null;
     lastCompaction = undefined;
     targetPercent = DEFAULT_TARGET_PERCENT;
+    endOfTurnThreshold = null;
+    agentRunActive = false;
+    compactedAfterLastTurn = false;
+    lastTurnOutcome = null;
+  });
+
+  pi.on("agent_start", () => {
+    if (!agentRunActive) {
+      agentRunActive = true;
+      compactedAfterLastTurn = false;
+      lastTurnOutcome = null;
+    }
+  });
+
+  // Wait for Pi's recovery/compaction work to finish before checking the final context.
+  pi.on("agent_settled", async (event, ctx) => {
+    const alreadyCompacted = compactedAfterLastTurn;
+    const completed = lastTurnOutcome === "completed";
+    agentRunActive = false;
+    compactedAfterLastTurn = false;
+    lastTurnOutcome = null;
+
+    if (
+      alreadyCompacted ||
+      !completed ||
+      event.aborted ||
+      !autoEnabled ||
+      !endOfTurnThreshold ||
+      compacting ||
+      stoppedAfterError ||
+      !ctx.isIdle() ||
+      ctx.hasPendingMessages() ||
+      !getCompactionPolicy(ctx).enabled
+    ) return;
+
+    const usage = ctx.getContextUsage();
+    if (!usage || usage.tokens === null) return;
+    if (!shouldCompactAtEndOfTurn(usage.tokens, usage.contextWindow, endOfTurnThreshold)) return;
+
+    await startCompaction(ctx, { source: "end-of-turn", resume: false });
   });
 
   pi.on("session_compact", (event) => {
+    if (agentRunActive) compactedAfterLastTurn = true;
     growth = createGrowthHistory();
     lastCompaction = {
       source: compactionSource ?? "Pi",
@@ -59,6 +107,8 @@ export default function piAc(pi: ExtensionAPI): void {
   });
 
   pi.on("turn_end", (event, ctx) => {
+    compactedAfterLastTurn = false;
+    lastTurnOutcome = event.outcome;
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null) return;
 
@@ -105,6 +155,9 @@ export default function piAc(pi: ExtensionAPI): void {
       case "threshold":
         setThreshold(ctx, value);
         return;
+      case "end-turn":
+        setEndOfTurnThreshold(ctx, value);
+        return;
       case "enable":
         autoEnabled = true;
         stoppedAfterError = false;
@@ -148,32 +201,58 @@ export default function piAc(pi: ExtensionAPI): void {
     report(ctx, `Adaptive compaction target set to ${parsed}% for this session.`);
   }
 
+  function setEndOfTurnThreshold(ctx: ExtensionCommandContext, value: string): void {
+    if (!value) {
+      showStatus(ctx);
+      return;
+    }
+    const parsed = parseEndOfTurnThreshold(value);
+    if (parsed === undefined) {
+      report(ctx, "Usage: /ac end-turn <off|token-count|percent%>", "warning");
+      return;
+    }
+    endOfTurnThreshold = parsed;
+    report(
+      ctx,
+      parsed === null
+        ? "End-of-turn compaction disabled for this session."
+        : `End-of-turn compaction threshold set to ${formatEndOfTurnThreshold(parsed)} for this session.`,
+    );
+  }
+
   function startCompaction(
     ctx: ExtensionContext,
     options: { source: Exclude<CompactionSource, "Pi">; resume: boolean; customInstructions?: string },
-  ): void {
-    if (compacting) return;
+  ): Promise<void> {
+    if (compacting) return Promise.resolve();
     compacting = true;
     compactionWasAborted = false;
     compactionSource = options.source;
     let finished = false;
 
-    const finish = (success: boolean) => {
-      if (finished) return;
-      finished = true;
-      compacting = false;
-      compactionSource = null;
-      growth = createGrowthHistory();
-      if (!success) stoppedAfterError = true;
-      if (options.resume && !compactionWasAborted) pi.sendUserMessage(RESUME_PROMPT);
-    };
+    return new Promise((resolve) => {
+      const finish = (success: boolean) => {
+        if (finished) return;
+        finished = true;
+        compacting = false;
+        compactionSource = null;
+        growth = createGrowthHistory();
+        if (!success) stoppedAfterError = true;
+        if (options.resume && !compactionWasAborted) pi.sendUserMessage(RESUME_PROMPT);
+        resolve();
+      };
 
-    // Use Pi's summary. Manual compaction stops the current run, so queue one
-    // continuation when that run had unfinished work.
-    ctx.compact({
-      customInstructions: options.customInstructions,
-      onComplete: () => finish(true),
-      onError: () => finish(false),
+      // Use Pi's summary. Manual compaction stops the current run, so queue one
+      // continuation when that run had unfinished work.
+      try {
+        ctx.compact({
+          customInstructions: options.customInstructions,
+          onComplete: () => finish(true),
+          onError: () => finish(false),
+        });
+      } catch {
+        finish(false);
+      }
     });
   }
 
@@ -193,9 +272,10 @@ export default function piAc(pi: ExtensionAPI): void {
     report(
       ctx,
       [
-        "/ac status                 Show context and adaptive threshold",
+        "/ac status                 Show context and compaction thresholds",
         "/ac compact [focus]        Run Pi's compaction; resume an interrupted task",
         "/ac threshold <1-100|off>  Set this session's adaptive target",
+        "/ac end-turn <off|token-count|percent%>  Set a final compaction threshold",
         "/ac enable | disable        Toggle proactive compaction",
         "/ac help                   Show these commands",
       ].join("\n"),
@@ -210,6 +290,7 @@ export default function piAc(pi: ExtensionAPI): void {
       `pi-ac: ${autoEnabled ? "automatic compaction enabled" : "automatic compaction disabled"}`,
       `context: ${usage?.tokens?.toLocaleString() ?? "unknown"} / ${usage?.contextWindow.toLocaleString() ?? "unknown"}`,
     ];
+    lines.push(`end-of-turn compaction: ${formatEndOfTurnThreshold(endOfTurnThreshold, usage?.contextWindow)}`);
     if (usage && usage.contextWindow > 0) {
       const nativeThreshold = Math.max(0, usage.contextWindow - policy.reserveTokens);
       const adaptiveThreshold = targetPercent === null
@@ -233,6 +314,18 @@ export default function piAc(pi: ExtensionAPI): void {
 function report(ctx: ExtensionCommandContext, message: string, type: "info" | "warning" = "info"): void {
   if (ctx.hasUI) ctx.ui.notify(message, type);
   else console.log(`[pi-ac] ${message}`);
+}
+
+function formatEndOfTurnThreshold(
+  threshold: EndOfTurnThreshold | null,
+  contextWindow?: number,
+): string {
+  if (threshold === null) return "off";
+  if (threshold.unit === "tokens") return `${threshold.value.toLocaleString()} tokens`;
+  const estimate = contextWindow && contextWindow > 0
+    ? ` (~${formatTokens(Math.floor((contextWindow * threshold.value) / 100))})`
+    : "";
+  return `${threshold.value}% of context window${estimate}`;
 }
 
 function formatTokens(tokens: number): string {
