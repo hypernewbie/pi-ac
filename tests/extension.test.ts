@@ -6,6 +6,12 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
   let commandHandler: ((args: string, ctx: any) => unknown) | undefined;
   let tokens = 40_000;
   let compactOptions: any;
+  let compactModel: any;
+  let thinkingLevel = "high";
+  const activeModel = { provider: "test", id: "model" };
+  const alternateModel = { provider: "other", id: "active" };
+  const availableModels = [activeModel, alternateModel];
+  let ctx: any;
   const pi: any = {
     on: (name: string, handler: (event: any, ctx: any) => unknown) => {
       handlers[name] = handler;
@@ -24,17 +30,32 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
           : {},
       },
     }),
+    setModel: vi.fn(async (model: any) => {
+      ctx.model = model;
+      return true;
+    }),
+    getThinkingLevel: () => thinkingLevel,
+    setThinkingLevel: vi.fn((level: string) => {
+      thinkingLevel = level;
+    }),
     sendUserMessage: vi.fn(),
   };
-  const ctx: any = {
-    model: { provider: "test", id: "model" },
+  ctx = {
+    model: activeModel,
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) =>
+        availableModels.find((model) => model.provider === provider && model.id === id),
+      ),
+    },
     getContextUsage: () => ({ tokens, contextWindow: 100_000, percent: tokens / 1_000 }),
     compact: vi.fn((value) => {
       compactOptions = value;
+      compactModel = ctx.model;
     }),
     hasUI: true,
     isIdle: vi.fn(() => true),
     hasPendingMessages: vi.fn(() => false),
+    abort: vi.fn(),
     ui: { notify: vi.fn() },
   };
   piAc(pi);
@@ -54,9 +75,19 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     ctx,
     turn,
     command: (args: string) => commandHandler?.(args, ctx),
+    activeModel,
+    alternateModel,
+    compactModel: () => compactModel,
     startSession: () => handlers.session_start({}, ctx),
-    startRun: () => handlers.agent_start({}, ctx),
-    settle: (aborted = false) => handlers.agent_settled({ aborted }, ctx),
+    shutdownSession: () => handlers.session_shutdown({}, ctx),
+    startRun: () => {
+      ctx.isIdle.mockReturnValue(false);
+      return handlers.agent_start({}, ctx);
+    },
+    settle: (aborted = false) => {
+      ctx.isIdle.mockReturnValue(true);
+      return handlers.agent_settled({ aborted }, ctx);
+    },
     noteCompaction: () => handlers.session_compact({ compactionEntry: { tokensBefore: tokens } }, ctx),
     failCompact: (aborted = false) => {
       handlers.session_compact_failed({ reason: "manual", aborted }, ctx);
@@ -70,7 +101,7 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
 }
 
 describe("pi-ac lifecycle", () => {
-  it("uses Pi's default compaction and queues one continuation", () => {
+  it("uses Pi's default compaction and queues one continuation", async () => {
     const { pi, ctx, turn, completeCompact } = harness();
     turn(40_000);
     turn(70_000); // The observed 30k growth predicts crossing Pi's 83,616-token threshold.
@@ -79,7 +110,7 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact.mock.calls[0][0].customInstructions).toBeUndefined();
     completeCompact();
     completeCompact();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
     expect(pi.sendUserMessage).toHaveBeenCalledWith(
       "Continue the current task from the compacted context. Do not repeat completed work.",
     );
@@ -101,13 +132,13 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact).not.toHaveBeenCalled();
   });
 
-  it("resumes once after a compaction error, then leaves recovery to Pi", () => {
+  it("resumes once after a compaction error, then leaves recovery to Pi", async () => {
     const { pi, ctx, turn, failCompact } = harness();
     turn(40_000);
     turn(70_000);
     expect(ctx.compact).toHaveBeenCalledTimes(1);
     failCompact();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
 
     turn(80_000);
     expect(ctx.compact).toHaveBeenCalledTimes(1);
@@ -130,6 +161,8 @@ describe("pi-ac lifecycle", () => {
     expect(messages).toContain("/ac compact");
     expect(messages).toContain("/ac threshold");
     expect(messages).toContain("/ac end-turn");
+    expect(messages).toContain("/ac end-turn-delay");
+    expect(messages).toContain("/ac compactor");
     expect(messages).toContain("/ac enable | disable");
 
     command("end-turn 80%");
@@ -138,19 +171,65 @@ describe("pi-ac lifecycle", () => {
     expect(status).toContain("end-of-turn compaction: 80% of context window (~80K)");
   });
 
+  it("saves the active model as compactor and can clear it", async () => {
+    const { ctx, command, activeModel, startSession } = harness();
+    await command("compactor current");
+    await command("status");
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: test/model");
+
+    await command("compactor clear");
+    await command("status");
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
+
+    await command("compactor current");
+    startSession();
+    await command("status");
+    expect(ctx.model).toBe(activeModel);
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
+  });
+
+  it("uses the active model after clearing the compactor", async () => {
+    const { pi, ctx, command, alternateModel, completeCompact, compactModel } = harness();
+    await command("compactor current");
+    await command("compactor clear");
+    ctx.model = alternateModel;
+
+    const compaction = command("compact");
+    await vi.waitFor(() => expect(ctx.compact).toHaveBeenCalledTimes(1));
+    expect(compactModel()).toBe(alternateModel);
+    completeCompact();
+    await compaction;
+    expect(pi.setModel).not.toHaveBeenCalled();
+  });
+
+  it("skips compaction if the saved compactor cannot be selected", async () => {
+    const { pi, ctx, command, alternateModel } = harness();
+    await command("compactor current");
+    ctx.model = alternateModel;
+    pi.setModel.mockResolvedValueOnce(false);
+
+    await command("compact");
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n"))
+      .toContain("Compactor model is not available: test/model");
+  });
+
   it("can disable and resets the end-of-turn threshold per session", () => {
     const { ctx, command, startSession } = harness();
+    command("end-turn-delay 5");
     command("end-turn 120000");
     command("end-turn off");
     command("status");
     let status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
     expect(status).toContain("end-of-turn compaction: off");
+    expect(status).toContain("end-of-turn delay: 5 minutes");
 
     command("end-turn 120000");
     startSession();
     command("status");
     status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
     expect(status).toContain("end-of-turn compaction: off");
+    expect(status).toContain("end-of-turn delay: 0 minutes (immediate)");
   });
 
   it("compacts a completed run at an absolute end-of-turn threshold without resuming", async () => {
@@ -168,15 +247,118 @@ describe("pi-ac lifecycle", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("uses a percentage of the current context window at settlement", async () => {
-    const { ctx, command, startRun, turn, settle, completeCompact } = harness();
-    command("end-turn 75%");
+  it("delays end-of-turn compaction and rechecks when the delay expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, command, startRun, turn, settle, completeCompact } = harness();
+      await command("end-turn 70000");
+      await command("end-turn-delay 2");
+      startRun();
+      turn(40_000);
+      turn(75_000, false);
+      await settle();
+
+      expect(ctx.compact).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(119_999);
+      expect(ctx.compact).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(ctx.compact).toHaveBeenCalledTimes(1);
+      completeCompact();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a delayed end-of-turn compaction when a new run starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, command, startRun, turn, settle } = harness();
+      await command("end-turn 70000");
+      await command("end-turn-delay 1");
+      startRun();
+      turn(40_000);
+      turn(75_000, false);
+      await settle();
+
+      startRun();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ctx.compact).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears a delayed end-of-turn timer when the session shuts down", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, command, startRun, turn, settle, shutdownSession } = harness();
+      await command("end-turn 70000");
+      await command("end-turn-delay 1");
+      startRun();
+      turn(40_000);
+      turn(75_000, false);
+      await settle();
+
+      shutdownSession();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ctx.compact).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses a percentage threshold and the configured compactor at settlement", async () => {
+    const { pi, ctx, command, activeModel, alternateModel, startRun, turn, settle, completeCompact, compactModel } = harness();
+    await command("compactor current");
+    ctx.model = alternateModel;
+    await command("end-turn 75%");
     startRun();
     turn(75_000, false);
     const settling = settle();
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(ctx.compact).toHaveBeenCalledTimes(1));
+    expect(compactModel()).toBe(activeModel);
     completeCompact();
     await settling;
+    expect(ctx.model).toBe(alternateModel);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("switches to the saved model for manual compaction and restores the active model", async () => {
+    const { pi, ctx, command, activeModel, alternateModel, completeCompact, compactModel } = harness();
+    await command("compactor current");
+    ctx.model = alternateModel;
+
+    const compaction = command("compact");
+    await vi.waitFor(() => expect(ctx.compact).toHaveBeenCalledTimes(1));
+    expect(compactModel()).toBe(activeModel);
+    completeCompact();
+    await compaction;
+
+    expect(ctx.model).toBe(alternateModel);
+    expect(pi.setModel).toHaveBeenNthCalledWith(1, activeModel);
+    expect(pi.setModel).toHaveBeenNthCalledWith(2, alternateModel);
+    expect(pi.setThinkingLevel).toHaveBeenCalledWith("high");
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses the saved compactor for automatic compaction and resumes on the active model", async () => {
+    const { pi, ctx, command, activeModel, alternateModel, startRun, turn, settle, completeCompact, compactModel } = harness();
+    await command("compactor current");
+    ctx.model = alternateModel;
+    startRun();
+    turn(40_000);
+    turn(70_000);
+
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+    expect(ctx.compact).not.toHaveBeenCalled();
+    const settling = settle(true);
+    await vi.waitFor(() => expect(ctx.compact).toHaveBeenCalledTimes(1));
+    expect(compactModel()).toBe(activeModel);
+    completeCompact();
+    await settling;
+
+    expect(ctx.model).toBe(alternateModel);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   it("keeps end-of-turn compaction opt-in and skips aborted or already-compacted runs", async () => {
@@ -265,17 +447,21 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
-  it("compacts with Pi's default and resumes only an interrupted task", () => {
+  it("compacts with Pi's default and resumes only an interrupted task", async () => {
     const active = harness();
     active.ctx.isIdle.mockReturnValue(false);
-    active.command("compact keep the current plan");
+    const activeCompaction = active.command("compact keep the current plan");
+    await vi.waitFor(() => expect(active.ctx.compact).toHaveBeenCalledTimes(1));
     expect(active.ctx.compact.mock.calls[0][0].customInstructions).toBe("keep the current plan");
     active.completeCompact();
+    await activeCompaction;
     expect(active.pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
     const idle = harness();
-    idle.command("compact");
+    const idleCompaction = idle.command("compact");
+    await vi.waitFor(() => expect(idle.ctx.compact).toHaveBeenCalledTimes(1));
     idle.completeCompact();
+    await idleCompaction;
     expect(idle.pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
