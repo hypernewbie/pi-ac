@@ -12,6 +12,44 @@ import {
 } from "./policy.ts";
 
 const RESUME_PROMPT = "Continue the current task from the compacted context. Do not repeat completed work.";
+const AC_COMMANDS = [
+  { name: "help", description: "Show help and current session status" },
+  { name: "status", description: "Show context usage and compaction settings" },
+  { name: "compact", description: "Compact now; resume interrupted work" },
+  { name: "threshold", description: "Set the adaptive target" },
+  { name: "end-turn", description: "Set the end-of-turn token threshold" },
+  { name: "end-turn-delay", description: "Set the end-of-turn delay in minutes" },
+  { name: "compactor", description: "Save or clear the summary model" },
+  { name: "enable", description: "Enable proactive compaction" },
+  { name: "disable", description: "Disable proactive compaction" },
+] as const;
+const AC_ARGUMENTS: Record<string, { value: string; description: string }[]> = {
+  threshold: [
+    { value: "off", description: "Use Pi's native threshold only" },
+    { value: "50", description: "Set a 50% target" },
+    { value: "60", description: "Set a 60% target" },
+    { value: "70", description: "Set a 70% target" },
+    { value: "80", description: "Set an 80% target" },
+    { value: "90", description: "Set a 90% target" },
+    { value: "100", description: "Set a 100% target" },
+  ],
+  "end-turn": [
+    { value: "off", description: "Disable end-of-turn compaction" },
+    { value: "80%", description: "Compact at 80% of the context window" },
+    { value: "90%", description: "Compact at 90% of the context window" },
+    { value: "120000", description: "Compact at 120,000 tokens" },
+  ],
+  "end-turn-delay": [
+    { value: "0", description: "Compact immediately" },
+    { value: "1", description: "Wait 1 minute" },
+    { value: "5", description: "Wait 5 minutes" },
+    { value: "10", description: "Wait 10 minutes" },
+  ],
+  compactor: [
+    { value: "current", description: "Save the active model for summaries" },
+    { value: "clear", description: "Use the active model for summaries" },
+  ],
+};
 type CompactionSource = "automatic" | "command" | "end-of-turn" | "Pi";
 
 interface LastCompaction {
@@ -57,7 +95,8 @@ export default function piAc(pi: ExtensionAPI): void {
   let lastTurnOutcome: "completed" | "aborted" | "error" | null = null;
 
   pi.registerCommand("ac", {
-    description: "Automatic compaction controls",
+    description: "Show help, check status, and manage context compaction",
+    getArgumentCompletions: getAcArgumentCompletions,
     handler: async (args, ctx) => handleCommand(args, ctx),
   });
 
@@ -229,8 +268,7 @@ export default function piAc(pi: ExtensionAPI): void {
         });
         return;
       default:
-        report(ctx, `Unknown /ac command: ${subcommand}`, "warning");
-        showHelp(ctx);
+        showHelp(ctx, `Unknown /ac command: ${subcommand}`);
     }
   }
 
@@ -470,25 +508,36 @@ export default function piAc(pi: ExtensionAPI): void {
     };
   }
 
-  function showHelp(ctx: ExtensionCommandContext): void {
-    report(
-      ctx,
-      [
-        "/ac status                 Show context and compaction thresholds",
-        "/ac compact [focus]        Run Pi's compaction; resume an interrupted task",
-        "/ac threshold <1-100|off>  Set this session's adaptive target",
-        "/ac end-turn <off|token-count|percent%>  Set a final compaction threshold",
-        "/ac end-turn-delay <minutes>  Delay final compaction (0 = immediately)",
-        "/ac compactor current     Save current model for summaries",
-        "/ac compactor clear       Use the active model for summaries",
-        "/ac enable | disable        Toggle proactive compaction",
-        "/ac help                   Show these commands",
-      ].join("\n"),
-    );
-    showStatus(ctx);
+  function showHelp(ctx: ExtensionCommandContext, warning?: string): void {
+    const lines = [
+      "pi-ac: context compaction controls",
+      "",
+      "Usage: /ac [help] or /ac <command> [arguments]",
+      "",
+      "/ac or /ac help           Show this guide and current session status",
+      "/ac compact [focus]       Compact now; resume interrupted work",
+      "/ac status                Show context and compaction settings",
+      "/ac threshold <1-100|off> Set adaptive target; off uses Pi's threshold",
+      "/ac end-turn <token-count|percent%|off> Set final-run threshold (off by default)",
+      "/ac end-turn-delay <minutes>   Wait before final compaction; 0 is immediate",
+      "/ac compactor current    Save the active model for summaries",
+      "/ac compactor clear      Use the active model for each summary",
+      "/ac enable | disable     Toggle proactive compaction",
+      "",
+      "Examples: /ac threshold 80 · /ac end-turn 120000 · /ac end-turn-delay 5",
+      "",
+      "Current session:",
+      ...getStatusLines(ctx),
+    ];
+    if (warning) lines.unshift(warning, "");
+    report(ctx, lines.join("\n"), warning ? "warning" : "info");
   }
 
   function showStatus(ctx: ExtensionCommandContext): void {
+    report(ctx, getStatusLines(ctx).join("\n"));
+  }
+
+  function getStatusLines(ctx: ExtensionContext): string[] {
     const usage = ctx.getContextUsage();
     const policy = getCompactionPolicy(ctx);
     const lines = [
@@ -514,8 +563,37 @@ export default function piAc(pi: ExtensionAPI): void {
     if (lastCompaction) {
       lines.push(`last compaction: ${lastCompaction.source} · ~${formatTokens(lastCompaction.tokensBefore)} before`);
     }
-    report(ctx, lines.join("\n"));
+    return lines;
   }
+}
+
+function getAcArgumentCompletions(prefix: string) {
+  const normalized = prefix.trimStart();
+  const separator = normalized.indexOf(" ");
+  if (separator === -1) {
+    const commandPrefix = normalized.toLowerCase();
+    const matches = AC_COMMANDS.filter((command) => command.name.startsWith(commandPrefix));
+    return matches.length > 0
+      ? matches.map((command) => ({
+          value: `${command.name} `,
+          label: command.name,
+          description: command.description,
+        }))
+      : null;
+  }
+
+  const command = normalized.slice(0, separator).toLowerCase();
+  const argumentPrefix = normalized.slice(separator + 1).trimStart().toLowerCase();
+  const options = AC_ARGUMENTS[command];
+  if (!options) return null;
+  const matches = options.filter((option) => option.value.toLowerCase().startsWith(argumentPrefix));
+  return matches.length > 0
+    ? matches.map((option) => ({
+        value: `${command} ${option.value}`,
+        label: option.value,
+        description: option.description,
+      }))
+    : null;
 }
 
 function report(ctx: ExtensionContext, message: string, type: "info" | "warning" = "info"): void {

@@ -16,7 +16,7 @@ A Pi extension that starts native compaction early during long-running tasks. It
 
 | Command | Action |
 |---|---|
-| `/ac` or `/ac help` | Show commands and status |
+| `/ac` or `/ac help` | Show help and current session status |
 | `/ac status` | Show usage, thresholds, compactor model, growth forecast, and last compaction |
 | `/ac compact [focus]` | Run Pi's compaction; resume an interrupted task |
 | `/ac threshold <1-100\|off>` | Set this session's adaptive target; `off` uses growth forecasting against Pi's threshold |
@@ -25,6 +25,8 @@ A Pi extension that starts native compaction early during long-running tasks. It
 | `/ac compactor current` | Save the active `provider/model` as the compactor for this session |
 | `/ac compactor clear` | Clear the saved compactor and use the active model |
 | `/ac enable` / `/ac disable` | Enable or disable proactive compaction for this session |
+
+Type `/ac ` to see command suggestions. Setting commands also suggest common values.
 
 pi-ac does not prune messages or add a footer or statusline.
 

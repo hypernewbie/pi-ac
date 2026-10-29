@@ -4,6 +4,7 @@ import piAc from "../src/index.ts";
 function harness(options: { enabled?: boolean; reserveTokens?: number; overrideReserve?: number } = {}) {
   const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
   let commandHandler: ((args: string, ctx: any) => unknown) | undefined;
+  let commandCompletions: ((prefix: string) => any) | undefined;
   let tokens = 40_000;
   let compactOptions: any;
   let compactModel: any;
@@ -20,6 +21,7 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     registerCommand: (name: string, command: any) => {
       expect(name).toBe("ac");
       commandHandler = command.handler;
+      commandCompletions = command.getArgumentCompletions;
     },
     getSettings: () => ({
       compaction: {
@@ -75,6 +77,7 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     ctx,
     turn,
     command: (args: string) => commandHandler?.(args, ctx),
+    completeArgs: (prefix: string) => commandCompletions?.(prefix) ?? null,
     activeModel,
     alternateModel,
     compactModel: () => compactModel,
@@ -156,7 +159,10 @@ describe("pi-ac lifecycle", () => {
     const { ctx, command } = harness();
     command("help");
     expect(ctx.compact).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
     const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Usage: /ac [help]");
+    expect(messages).toContain("Current session:");
     expect(messages).toContain("/ac status");
     expect(messages).toContain("/ac compact");
     expect(messages).toContain("/ac threshold");
@@ -169,6 +175,18 @@ describe("pi-ac lifecycle", () => {
     command("status");
     const status = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
     expect(status).toContain("end-of-turn compaction: 80% of context window (~80K)");
+  });
+
+  it("completes /ac subcommands and their common values", () => {
+    const { completeArgs } = harness();
+    expect(completeArgs("").map((item: any) => item.value)).toContain("status ");
+    expect(completeArgs("comp").map((item: any) => item.value)).toEqual(["compact ", "compactor "]);
+    expect(completeArgs("compactor c").map((item: any) => item.value)).toEqual([
+      "compactor current",
+      "compactor clear",
+    ]);
+    expect(completeArgs("end-turn-delay ").map((item: any) => item.value)).toContain("end-turn-delay 0");
+    expect(completeArgs("unknown")).toBeNull();
   });
 
   it("saves the active model as compactor and can clear it", async () => {
