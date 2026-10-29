@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import piAc from "../src/index.ts";
 
-function harness(options: { enabled?: boolean; reserveTokens?: number; overrideReserve?: number } = {}) {
+function harness(options: { enabled?: boolean; reserveTokens?: number; overrideReserve?: number; contextWindow?: number } = {}) {
   const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
   let commandHandler: ((args: string, ctx: any) => unknown) | undefined;
   let commandCompletions: ((prefix: string) => any) | undefined;
   let tokens = 40_000;
+  const contextWindow = options.contextWindow ?? 100_000;
   let compactOptions: any;
   let compactModel: any;
   let thinkingLevel = "high";
@@ -49,7 +50,7 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
         availableModels.find((model) => model.provider === provider && model.id === id),
       ),
     },
-    getContextUsage: () => ({ tokens, contextWindow: 100_000, percent: tokens / 1_000 }),
+    getContextUsage: () => ({ tokens, contextWindow, percent: (tokens / contextWindow) * 100 }),
     compact: vi.fn((value) => {
       compactOptions = value;
       compactModel = ctx.model;
@@ -186,6 +187,8 @@ describe("pi-ac lifecycle", () => {
       "compactor clear",
     ]);
     expect(completeArgs("end-turn-delay ").map((item: any) => item.value)).toContain("end-turn-delay 0");
+    expect(completeArgs("end-turn ").map((item: any) => item.value)).toContain("end-turn default");
+    expect(completeArgs("threshold ").map((item: any) => item.value)).toContain("threshold default");
     expect(completeArgs("unknown")).toBeNull();
   });
 
@@ -236,9 +239,14 @@ describe("pi-ac lifecycle", () => {
     const { ctx, command, startSession } = harness();
     command("end-turn-delay 5");
     command("end-turn 120000");
-    command("end-turn off");
+    command("end-turn default");
     command("status");
     let status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
+    expect(status).toContain("200K tokens or 40% of context window (whichever is higher)");
+
+    command("end-turn off");
+    command("status");
+    status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
     expect(status).toContain("end-of-turn compaction: off");
     expect(status).toContain("end-of-turn delay: 5 minutes");
 
@@ -246,13 +254,38 @@ describe("pi-ac lifecycle", () => {
     startSession();
     command("status");
     status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
-    expect(status).toContain("end-of-turn compaction: off");
-    expect(status).toContain("end-of-turn delay: 0 minutes (immediate)");
+    expect(status).toContain("end-of-turn compaction: 200K tokens or 40% of context window (whichever is higher)");
+    expect(status).toContain("end-of-turn delay: 10 minutes");
+  });
+
+  it("enables end-of-turn compaction by default at max(200K, 40%) after ten minutes", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, command, startRun, turn, settle, completeCompact } = harness({ contextWindow: 1_000_000 });
+      await command("status");
+      const status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
+      expect(status).toContain("200K tokens or 40% of context window (whichever is higher) (~400K)");
+      expect(status).toContain("end-of-turn delay: 10 minutes");
+
+      startRun();
+      turn(400_000, false);
+      await settle();
+      expect(ctx.compact).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(599_999);
+      expect(ctx.compact).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(ctx.compact).toHaveBeenCalledTimes(1);
+      completeCompact();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("compacts a completed run at an absolute end-of-turn threshold without resuming", async () => {
     const { pi, ctx, command, startRun, turn, settle, completeCompact } = harness();
     command("end-turn 70000");
+    command("end-turn-delay 0");
     startRun();
     turn(40_000);
     turn(75_000, false);
@@ -330,6 +363,7 @@ describe("pi-ac lifecycle", () => {
     await command("compactor current");
     ctx.model = alternateModel;
     await command("end-turn 75%");
+    await command("end-turn-delay 0");
     startRun();
     turn(75_000, false);
     const settling = settle();
@@ -379,13 +413,7 @@ describe("pi-ac lifecycle", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps end-of-turn compaction opt-in and skips aborted or already-compacted runs", async () => {
-    const disabledByDefault = harness();
-    disabledByDefault.startRun();
-    disabledByDefault.turn(90_000, false);
-    await disabledByDefault.settle();
-    expect(disabledByDefault.ctx.compact).not.toHaveBeenCalled();
-
+  it("skips end-of-turn compaction for aborted or already-compacted runs", async () => {
     const aborted = harness();
     aborted.command("end-turn 80%");
     aborted.startRun();
@@ -410,6 +438,7 @@ describe("pi-ac lifecycle", () => {
 
     const compactedThenContinued = harness();
     compactedThenContinued.command("end-turn 80%");
+    compactedThenContinued.command("end-turn-delay 0");
     compactedThenContinued.startRun();
     compactedThenContinued.turn(60_000, false);
     compactedThenContinued.noteCompaction();
@@ -445,12 +474,17 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact).not.toHaveBeenCalled();
   });
 
-  it("sets the adaptive threshold through /ac threshold", () => {
+  it("sets and restores the default adaptive threshold through /ac threshold", () => {
     const { ctx, command, turn } = harness();
     command("threshold 60");
     turn(40_000);
     turn(59_000);
     expect(ctx.compact).toHaveBeenCalledTimes(1);
+
+    command("threshold default");
+    command("status");
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0]))
+      .toContain("adaptive target: 50% or 230K tokens (whichever is lower; ~50K)");
   });
 
   it("toggles proactive compaction with /ac enable and disable", () => {
@@ -490,13 +524,13 @@ describe("pi-ac lifecycle", () => {
     expect(disabled.ctx.compact).not.toHaveBeenCalled();
 
     const baseline = harness();
-    baseline.turn(65_000);
-    baseline.turn(68_000);
+    baseline.turn(30_000);
+    baseline.turn(39_000);
     expect(baseline.ctx.compact).not.toHaveBeenCalled();
 
-    const overridden = harness({ overrideReserve: 30_000 });
-    overridden.turn(65_000);
-    overridden.turn(68_000); // Forecast crosses the model override's 70k native threshold.
+    const overridden = harness({ overrideReserve: 60_000 });
+    overridden.turn(30_000);
+    overridden.turn(39_000); // Forecast crosses the model override's 40k native threshold.
     expect(overridden.ctx.compact).toHaveBeenCalledTimes(1);
   });
 });

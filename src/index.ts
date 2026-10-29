@@ -2,7 +2,11 @@ import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createGrowthHistory,
+  DEFAULT_END_OF_TURN_DELAY_MINUTES,
+  DEFAULT_END_OF_TURN_MIN_TOKENS,
+  DEFAULT_END_OF_TURN_THRESHOLD,
   DEFAULT_TARGET_PERCENT,
+  DEFAULT_TARGET_TOKENS,
   estimateNextTurnGrowth,
   observeTokens,
   parseEndOfTurnThreshold,
@@ -25,6 +29,7 @@ const AC_COMMANDS = [
 ] as const;
 const AC_ARGUMENTS: Record<string, { value: string; description: string }[]> = {
   threshold: [
+    { value: "default", description: "Restore the 50% or 230K-token target" },
     { value: "off", description: "Use Pi's native threshold only" },
     { value: "50", description: "Set a 50% target" },
     { value: "60", description: "Set a 60% target" },
@@ -34,6 +39,7 @@ const AC_ARGUMENTS: Record<string, { value: string; description: string }[]> = {
     { value: "100", description: "Set a 100% target" },
   ],
   "end-turn": [
+    { value: "default", description: "Restore the higher of 200K tokens or 40%" },
     { value: "off", description: "Disable end-of-turn compaction" },
     { value: "80%", description: "Compact at 80% of the context window" },
     { value: "90%", description: "Compact at 90% of the context window" },
@@ -43,7 +49,7 @@ const AC_ARGUMENTS: Record<string, { value: string; description: string }[]> = {
     { value: "0", description: "Compact immediately" },
     { value: "1", description: "Wait 1 minute" },
     { value: "5", description: "Wait 5 minutes" },
-    { value: "10", description: "Wait 10 minutes" },
+    { value: "10", description: "Wait 10 minutes (default)" },
   ],
   compactor: [
     { value: "current", description: "Save the active model for summaries" },
@@ -85,8 +91,9 @@ export default function piAc(pi: ExtensionAPI): void {
   let compactionSource: CompactionSource | null = null;
   let lastCompaction: LastCompaction | undefined;
   let targetPercent: number | null = DEFAULT_TARGET_PERCENT;
-  let endOfTurnThreshold: EndOfTurnThreshold | null = null;
-  let endOfTurnDelayMinutes = 0;
+  let endOfTurnThreshold: EndOfTurnThreshold | null = { ...DEFAULT_END_OF_TURN_THRESHOLD };
+  let endOfTurnUsesDefault = true;
+  let endOfTurnDelayMinutes = DEFAULT_END_OF_TURN_DELAY_MINUTES;
   let endOfTurnTimer: ReturnType<typeof setTimeout> | undefined;
   let compactorModel: ModelReference | null = null;
   let pendingCompaction: PendingCompaction | undefined;
@@ -112,8 +119,9 @@ export default function piAc(pi: ExtensionAPI): void {
     compactionSource = null;
     lastCompaction = undefined;
     targetPercent = DEFAULT_TARGET_PERCENT;
-    endOfTurnThreshold = null;
-    endOfTurnDelayMinutes = 0;
+    endOfTurnThreshold = { ...DEFAULT_END_OF_TURN_THRESHOLD };
+    endOfTurnUsesDefault = true;
+    endOfTurnDelayMinutes = DEFAULT_END_OF_TURN_DELAY_MINUTES;
     compactorModel = null;
     agentRunActive = false;
     compactedAfterLastTurn = false;
@@ -277,6 +285,11 @@ export default function piAc(pi: ExtensionAPI): void {
       showStatus(ctx);
       return;
     }
+    if (/^default$/i.test(value)) {
+      targetPercent = DEFAULT_TARGET_PERCENT;
+      report(ctx, "Adaptive target reset to 50% or 230,000 tokens, whichever is lower.");
+      return;
+    }
     if (/^(off|null|none)$/i.test(value)) {
       targetPercent = null;
       report(ctx, "Adaptive percentage target disabled for this session; growth forecasting still uses Pi's threshold.");
@@ -284,11 +297,11 @@ export default function piAc(pi: ExtensionAPI): void {
     }
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
-      report(ctx, "Usage: /ac threshold <1-100|off>", "warning");
+      report(ctx, "Usage: /ac threshold <default|1-100|off>", "warning");
       return;
     }
     targetPercent = parsed;
-    report(ctx, `Adaptive compaction target set to ${parsed}% for this session.`);
+    report(ctx, `Adaptive compaction target set to ${parsed}%, capped at 230,000 tokens, for this session.`);
   }
 
   function setEndOfTurnThreshold(ctx: ExtensionCommandContext, value: string): void {
@@ -296,12 +309,19 @@ export default function piAc(pi: ExtensionAPI): void {
       showStatus(ctx);
       return;
     }
+    if (/^default$/i.test(value)) {
+      endOfTurnThreshold = { ...DEFAULT_END_OF_TURN_THRESHOLD };
+      endOfTurnUsesDefault = true;
+      report(ctx, "End-of-turn compaction reset to 200,000 tokens or 40%, whichever is higher.");
+      return;
+    }
     const parsed = parseEndOfTurnThreshold(value);
     if (parsed === undefined) {
-      report(ctx, "Usage: /ac end-turn <off|token-count|percent%>", "warning");
+      report(ctx, "Usage: /ac end-turn <default|off|token-count|percent%>", "warning");
       return;
     }
     endOfTurnThreshold = parsed;
+    endOfTurnUsesDefault = false;
     if (parsed === null) cancelEndOfTurnTimer();
     report(
       ctx,
@@ -379,7 +399,12 @@ export default function piAc(pi: ExtensionAPI): void {
 
     const usage = ctx.getContextUsage();
     return usage !== undefined && usage.tokens !== null &&
-      shouldCompactAtEndOfTurn(usage.tokens, usage.contextWindow, endOfTurnThreshold);
+      shouldCompactAtEndOfTurn(
+        usage.tokens,
+        usage.contextWindow,
+        endOfTurnThreshold,
+        endOfTurnUsesDefault ? DEFAULT_END_OF_TURN_MIN_TOKENS : undefined,
+      );
   }
 
   function scheduleEndOfTurnCompaction(ctx: ExtensionContext): Promise<void> {
@@ -517,13 +542,14 @@ export default function piAc(pi: ExtensionAPI): void {
       "/ac or /ac help           Show this guide and current session status",
       "/ac compact [focus]       Compact now; resume interrupted work",
       "/ac status                Show context and compaction settings",
-      "/ac threshold <1-100|off> Set adaptive target; off uses Pi's threshold",
-      "/ac end-turn <token-count|percent%|off> Set final-run threshold (off by default)",
-      "/ac end-turn-delay <minutes>   Wait before final compaction; 0 is immediate",
+      "/ac threshold <default|1-100|off> Set adaptive target; off uses Pi's threshold",
+      "/ac end-turn <default|token-count|percent%|off> Set final-run threshold",
+      "/ac end-turn-delay <minutes>   Wait before final compaction; default 10, 0 is immediate",
       "/ac compactor current    Save the active model for summaries",
       "/ac compactor clear      Use the active model for each summary",
       "/ac enable | disable     Toggle proactive compaction",
       "",
+      "Defaults: adaptive min(230K, 50%); end-turn max(200K, 40%) after 10 minutes",
       "Examples: /ac threshold 80 · /ac end-turn 120000 · /ac end-turn-delay 5",
       "",
       "Current session:",
@@ -544,16 +570,26 @@ export default function piAc(pi: ExtensionAPI): void {
       `pi-ac: ${autoEnabled ? "automatic compaction enabled" : "automatic compaction disabled"}`,
       `context: ${usage?.tokens?.toLocaleString() ?? "unknown"} / ${usage?.contextWindow.toLocaleString() ?? "unknown"}`,
     ];
-    lines.push(`end-of-turn compaction: ${formatEndOfTurnThreshold(endOfTurnThreshold, usage?.contextWindow)}`);
+    lines.push(`end-of-turn compaction: ${formatEndOfTurnThreshold(
+      endOfTurnThreshold,
+      usage?.contextWindow,
+      endOfTurnUsesDefault ? DEFAULT_END_OF_TURN_MIN_TOKENS : undefined,
+    )}`);
     lines.push(`end-of-turn delay: ${formatEndOfTurnDelay(endOfTurnDelayMinutes)}`);
     lines.push(`compactor model: ${compactorModel ? formatModelReference(compactorModel) : "active model (no switch)"}`);
     if (usage && usage.contextWindow > 0) {
       const nativeThreshold = Math.max(0, usage.contextWindow - policy.reserveTokens);
       const adaptiveThreshold = targetPercent === null
         ? nativeThreshold
-        : Math.min(nativeThreshold, Math.floor((usage.contextWindow * targetPercent) / 100));
+        : Math.min(
+            nativeThreshold,
+            Math.floor((usage.contextWindow * targetPercent) / 100),
+            DEFAULT_TARGET_TOKENS,
+          );
       lines.push(
-        `adaptive target: ${targetPercent === null ? "Pi threshold" : `${targetPercent}% (~${formatTokens(adaptiveThreshold)})`}`,
+        `adaptive target: ${targetPercent === null
+          ? "Pi threshold"
+          : `${targetPercent}% or ${formatTokens(DEFAULT_TARGET_TOKENS)} tokens (whichever is lower; ~${formatTokens(adaptiveThreshold)})`}`,
       );
       lines.push(`Pi threshold: ~${formatTokens(nativeThreshold)} · reserve ${formatTokens(policy.reserveTokens)}`);
       lines.push(`recent growth forecast: ~${formatTokens(estimateNextTurnGrowth(growth))}`);
@@ -619,13 +655,21 @@ function formatEndOfTurnDelay(minutes: number): string {
 function formatEndOfTurnThreshold(
   threshold: EndOfTurnThreshold | null,
   contextWindow?: number,
+  minTokens?: number,
 ): string {
   if (threshold === null) return "off";
   if (threshold.unit === "tokens") return `${threshold.value.toLocaleString()} tokens`;
-  const estimate = contextWindow && contextWindow > 0
-    ? ` (~${formatTokens(Math.floor((contextWindow * threshold.value) / 100))})`
-    : "";
-  return `${threshold.value}% of context window${estimate}`;
+  const percentTokens = contextWindow && contextWindow > 0
+    ? Math.floor((contextWindow * threshold.value) / 100)
+    : undefined;
+  const effectiveTokens = percentTokens === undefined
+    ? undefined
+    : Math.max(percentTokens, minTokens ?? 0);
+  const estimate = effectiveTokens === undefined ? "" : ` (~${formatTokens(effectiveTokens)})`;
+  const description = minTokens === undefined
+    ? `${threshold.value}% of context window`
+    : `${formatTokens(minTokens)} tokens or ${threshold.value}% of context window (whichever is higher)`;
+  return `${description}${estimate}`;
 }
 
 function formatTokens(tokens: number): string {

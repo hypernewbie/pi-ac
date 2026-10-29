@@ -12,7 +12,11 @@ export type EndOfTurnThreshold =
   | { unit: "tokens"; value: number }
   | { unit: "percent"; value: number };
 
-export const DEFAULT_TARGET_PERCENT = 80;
+export const DEFAULT_TARGET_PERCENT = 50;
+export const DEFAULT_TARGET_TOKENS = 230_000;
+export const DEFAULT_END_OF_TURN_THRESHOLD: EndOfTurnThreshold = { unit: "percent", value: 40 };
+export const DEFAULT_END_OF_TURN_MIN_TOKENS = 200_000;
+export const DEFAULT_END_OF_TURN_DELAY_MINUTES = 10;
 const MAX_GROWTH_SAMPLES = 5;
 
 export function createGrowthHistory(): GrowthHistory {
@@ -62,6 +66,7 @@ export function shouldCompactAtEndOfTurn(
   tokens: number,
   contextWindow: number,
   threshold: EndOfTurnThreshold | null,
+  minTokens?: number,
 ): boolean {
   if (
     threshold === null ||
@@ -71,11 +76,18 @@ export function shouldCompactAtEndOfTurn(
     contextWindow <= 0
   ) return false;
 
+  if (minTokens !== undefined && (!Number.isSafeInteger(minTokens) || minTokens <= 0)) return false;
+
+  let thresholdTokens: number;
   if (threshold.unit === "tokens") {
-    return Number.isSafeInteger(threshold.value) && threshold.value > 0 && tokens >= threshold.value;
+    if (!Number.isSafeInteger(threshold.value) || threshold.value <= 0) return false;
+    thresholdTokens = threshold.value;
+  } else {
+    if (!Number.isFinite(threshold.value) || threshold.value <= 0 || threshold.value > 100) return false;
+    thresholdTokens = Math.floor((contextWindow * threshold.value) / 100);
   }
-  if (!Number.isFinite(threshold.value) || threshold.value <= 0 || threshold.value > 100) return false;
-  return tokens >= Math.floor((contextWindow * threshold.value) / 100);
+  if (minTokens !== undefined) thresholdTokens = Math.max(thresholdTokens, minTokens);
+  return tokens >= thresholdTokens;
 }
 
 /**
@@ -88,10 +100,12 @@ export function shouldAutoCompact(args: {
   contextWindow: number;
   policy: CompactionPolicy;
   targetPercent?: number | null;
+  targetTokens?: number | null;
   predictedGrowth: number;
 }): boolean {
   const { tokens, contextWindow, policy, predictedGrowth } = args;
   const targetPercent = args.targetPercent === undefined ? DEFAULT_TARGET_PERCENT : args.targetPercent;
+  const targetTokens = args.targetTokens === undefined ? DEFAULT_TARGET_TOKENS : args.targetTokens;
   if (
     !policy.enabled ||
     !Number.isFinite(tokens) ||
@@ -103,6 +117,9 @@ export function shouldAutoCompact(args: {
   if (targetPercent !== null && (!Number.isFinite(targetPercent) || targetPercent <= 0 || targetPercent > 100)) {
     return false;
   }
+  if (targetPercent !== null && targetTokens !== null && (!Number.isSafeInteger(targetTokens) || targetTokens <= 0)) {
+    return false;
+  }
 
   const nativeThreshold = Math.max(0, contextWindow - policy.reserveTokens);
   // Let Pi's own automatic compaction handle a threshold that has already been crossed.
@@ -110,6 +127,10 @@ export function shouldAutoCompact(args: {
 
   const policyThreshold = targetPercent === null
     ? nativeThreshold
-    : Math.min(nativeThreshold, Math.floor((contextWindow * targetPercent) / 100));
+    : Math.min(
+        nativeThreshold,
+        Math.floor((contextWindow * targetPercent) / 100),
+        targetTokens ?? Number.MAX_SAFE_INTEGER,
+      );
   return tokens + Math.max(0, predictedGrowth) >= policyThreshold;
 }
