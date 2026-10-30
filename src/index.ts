@@ -101,11 +101,13 @@ export default function piAc(pi: ExtensionAPI): void {
   let compactedAfterLastTurn = false;
   let lastTurnOutcome: "completed" | "aborted" | "error" | null = null;
 
-  pi.registerCommand("ac", {
+  const acCommand = {
     description: "Show help, check status, and manage context compaction",
     getArgumentCompletions: getAcArgumentCompletions,
-    handler: async (args, ctx) => handleCommand(args, ctx),
-  });
+    handler: async (args: string, ctx: ExtensionCommandContext) => handleCommand(args, ctx),
+  };
+  pi.registerCommand("ac", acCommand);
+  pi.registerCommand("autocompact", acCommand);
 
   pi.on("session_start", () => {
     cancelEndOfTurnTimer();
@@ -540,6 +542,7 @@ export default function piAc(pi: ExtensionAPI): void {
       "Usage: /ac [help] or /ac <command> [arguments]",
       "",
       "/ac or /ac help           Show this guide and current session status",
+      "/autocompact              Alias for /ac",
       "/ac compact [focus]       Compact now; resume interrupted work",
       "/ac status                Show context and compaction settings",
       "/ac threshold <default|1-100|off> Set adaptive target; off uses Pi's threshold",

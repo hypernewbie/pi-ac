@@ -3,8 +3,8 @@ import piAc from "../src/index.ts";
 
 function harness(options: { enabled?: boolean; reserveTokens?: number; overrideReserve?: number; contextWindow?: number } = {}) {
   const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
-  let commandHandler: ((args: string, ctx: any) => unknown) | undefined;
-  let commandCompletions: ((prefix: string) => any) | undefined;
+  const commandHandlers: Record<string, (args: string, ctx: any) => unknown> = {};
+  const commandCompletions: Record<string, (prefix: string) => any> = {};
   let tokens = 40_000;
   const contextWindow = options.contextWindow ?? 100_000;
   let compactOptions: any;
@@ -20,9 +20,9 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
       return () => {};
     },
     registerCommand: (name: string, command: any) => {
-      expect(name).toBe("ac");
-      commandHandler = command.handler;
-      commandCompletions = command.getArgumentCompletions;
+      expect(["ac", "autocompact"]).toContain(name);
+      commandHandlers[name] = command.handler;
+      commandCompletions[name] = command.getArgumentCompletions;
     },
     getSettings: () => ({
       compaction: {
@@ -77,8 +77,8 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
     pi,
     ctx,
     turn,
-    command: (args: string) => commandHandler?.(args, ctx),
-    completeArgs: (prefix: string) => commandCompletions?.(prefix) ?? null,
+    command: (args: string, name = "ac") => commandHandlers[name]?.(args, ctx),
+    completeArgs: (prefix: string, name = "ac") => commandCompletions[name]?.(prefix) ?? null,
     activeModel,
     alternateModel,
     compactModel: () => compactModel,
@@ -162,7 +162,8 @@ describe("pi-ac lifecycle", () => {
     expect(ctx.compact).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
     const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
-    expect(messages).toContain("Usage: /ac [help]");
+    expect(messages).toContain("/ac or /ac help");
+    expect(messages).toContain("/autocompact              Alias for /ac");
     expect(messages).toContain("Current session:");
     expect(messages).toContain("/ac status");
     expect(messages).toContain("/ac compact");
@@ -190,6 +191,19 @@ describe("pi-ac lifecycle", () => {
     expect(completeArgs("end-turn ").map((item: any) => item.value)).toContain("end-turn default");
     expect(completeArgs("threshold ").map((item: any) => item.value)).toContain("threshold default");
     expect(completeArgs("unknown")).toBeNull();
+  });
+
+  it("supports /autocompact as an alias with matching commands and completions", async () => {
+    const { ctx, command, completeArgs } = harness();
+    await command("threshold 60", "autocompact");
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("Adaptive compaction target set to 60%");
+
+    await command("status", "autocompact");
+    expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("adaptive target: 60% or 230K tokens");
+    expect(completeArgs("compactor c", "autocompact").map((item: any) => item.value)).toEqual([
+      "compactor current",
+      "compactor clear",
+    ]);
   });
 
   it("saves the active model as compactor and can clear it", async () => {
