@@ -1,7 +1,32 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import fs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piAc from "../src/index.ts";
+import { saveAdaptiveThreshold, saveEndOfTurnThreshold } from "../src/threshold-config.ts";
 
-function harness(options: { enabled?: boolean; reserveTokens?: number; overrideReserve?: number; contextWindow?: number } = {}) {
+let agentDir: string | undefined;
+
+beforeEach(async () => {
+  agentDir = await mkdtemp(path.join(tmpdir(), "pi-ac-extension-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+});
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  if (agentDir) await rm(agentDir, { recursive: true, force: true });
+  agentDir = undefined;
+});
+
+function harness(options: {
+  enabled?: boolean;
+  reserveTokens?: number;
+  overrideReserve?: number;
+  contextWindow?: number;
+  noContextUsage?: boolean;
+} = {}) {
   const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
   const commandHandlers: Record<string, (args: string, ctx: any) => unknown> = {};
   const commandCompletions: Record<string, (prefix: string) => any> = {};
@@ -50,7 +75,9 @@ function harness(options: { enabled?: boolean; reserveTokens?: number; overrideR
         availableModels.find((model) => model.provider === provider && model.id === id),
       ),
     },
-    getContextUsage: () => ({ tokens, contextWindow, percent: (tokens / contextWindow) * 100 }),
+    getContextUsage: () => options.noContextUsage
+      ? undefined
+      : { tokens, contextWindow, percent: (tokens / contextWindow) * 100 },
     compact: vi.fn((value) => {
       compactOptions = value;
       compactModel = ctx.model;
@@ -156,9 +183,9 @@ describe("pi-ac lifecycle", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("shows the /ac command interface", () => {
+  it("shows the /ac command interface", async () => {
     const { ctx, command } = harness();
-    command("help");
+    await command("help");
     expect(ctx.compact).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
     const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
@@ -172,11 +199,55 @@ describe("pi-ac lifecycle", () => {
     expect(messages).toContain("/ac end-turn-delay");
     expect(messages).toContain("/ac compactor");
     expect(messages).toContain("/ac enable | disable");
+    expect(messages).toContain("Thresholds save globally");
+    expect(messages).toContain("Other running Pi sessions do not update");
 
-    command("end-turn 80%");
-    command("status");
+    await command("end-turn 80%");
+    await command("status");
     const status = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
     expect(status).toContain("end-of-turn compaction: 80% of context window (~80K)");
+  });
+
+  it("uses defaults without warning or writing when no override exists", async () => {
+    const { ctx, startSession } = harness();
+    await startSession();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(await fs.readdir(agentDir!)).toEqual([]);
+  });
+
+  it("does not save invalid threshold commands", async () => {
+    const { ctx, command } = harness();
+    await command("threshold 0");
+    await command("end-turn 0%");
+    await command("status");
+
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages.match(/Usage:/g)).toHaveLength(2);
+    expect(messages).toContain("adaptive target: 50%");
+    expect(messages).toContain("200K tokens or 40% of context window");
+    await expect(fs.readFile(path.join(agentDir!, "pi-ac", "threshold.json")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.readFile(path.join(agentDir!, "pi-ac", "end-turn.json")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves off aliases, case handling, and fractional adaptive values", async () => {
+    const { ctx, command } = harness();
+    await command("threshold 65.5");
+    expect(JSON.parse(await fs.readFile(path.join(agentDir!, "pi-ac", "threshold.json"), "utf8")))
+      .toEqual({ version: 1, value: 65.5 });
+    await command("threshold NoNe");
+    await command("end-turn 75%");
+    await command("end-turn OFF");
+    await command("status");
+
+    const status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
+    expect(status).toContain("adaptive target: Pi threshold");
+    expect(status).toContain("end-of-turn compaction: off");
+    expect(JSON.parse(await fs.readFile(path.join(agentDir!, "pi-ac", "threshold.json"), "utf8")))
+      .toEqual({ version: 1, value: null });
+    expect(JSON.parse(await fs.readFile(path.join(agentDir!, "pi-ac", "end-turn.json"), "utf8")))
+      .toEqual({ version: 1, value: null });
   });
 
   it("completes /ac subcommands and their common values", () => {
@@ -217,7 +288,7 @@ describe("pi-ac lifecycle", () => {
     expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
 
     await command("compactor current");
-    startSession();
+    await startSession();
     await command("status");
     expect(ctx.model).toBe(activeModel);
     expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
@@ -249,27 +320,32 @@ describe("pi-ac lifecycle", () => {
       .toContain("Compactor model is not available: test/model");
   });
 
-  it("can disable and resets the end-of-turn threshold per session", () => {
+  it("persists end-of-turn threshold and resets other session controls", async () => {
     const { ctx, command, startSession } = harness();
-    command("end-turn-delay 5");
-    command("end-turn 120000");
-    command("end-turn default");
-    command("status");
+    await command("end-turn-delay 5");
+    await command("end-turn 120000");
+    await command("end-turn default");
+    await command("status");
     let status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
     expect(status).toContain("200K tokens or 40% of context window (whichever is higher)");
 
-    command("end-turn off");
-    command("status");
+    await command("end-turn off");
+    await command("status");
     status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
     expect(status).toContain("end-of-turn compaction: off");
     expect(status).toContain("end-of-turn delay: 5 minutes");
 
-    command("end-turn 120000");
-    startSession();
-    command("status");
+    await command("end-turn 120000");
+    await command("end-turn-delay 5");
+    await command("disable");
+    await command("compactor current");
+    await startSession();
+    await command("status");
     status = String(ctx.ui.notify.mock.calls.at(-1)?.[0]);
-    expect(status).toContain("end-of-turn compaction: 200K tokens or 40% of context window (whichever is higher)");
+    expect(status).toContain("end-of-turn compaction: 120,000 tokens");
     expect(status).toContain("end-of-turn delay: 10 minutes");
+    expect(status).toContain("automatic compaction enabled");
+    expect(status).toContain("compactor model: active model (no switch)");
   });
 
   it("enables end-of-turn compaction by default at max(200K, 40%) after ten minutes", async () => {
@@ -298,8 +374,8 @@ describe("pi-ac lifecycle", () => {
 
   it("compacts a completed run at an absolute end-of-turn threshold without resuming", async () => {
     const { pi, ctx, command, startRun, turn, settle, completeCompact } = harness();
-    command("end-turn 70000");
-    command("end-turn-delay 0");
+    await command("end-turn 70000");
+    await command("end-turn-delay 0");
     startRun();
     turn(40_000);
     turn(75_000, false);
@@ -372,6 +448,42 @@ describe("pi-ac lifecycle", () => {
     }
   });
 
+  it("keeps a pending timer after a failed off save and cancels it after a successful save", async () => {
+    vi.useFakeTimers();
+    try {
+      const failedOff = harness();
+      await failedOff.command("end-turn 70000");
+      await failedOff.command("end-turn-delay 1");
+      failedOff.startRun();
+      failedOff.turn(40_000);
+      failedOff.turn(75_000, false);
+      await failedOff.settle();
+
+      const failure = Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      vi.spyOn(fs, "open").mockRejectedValueOnce(failure);
+      await failedOff.command("end-turn off");
+      await failedOff.command("status");
+      expect(String(failedOff.ctx.ui.notify.mock.calls.at(-1)?.[0]))
+        .toContain("end-of-turn compaction: 70,000 tokens");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(failedOff.ctx.compact).toHaveBeenCalledTimes(1);
+      failedOff.completeCompact();
+
+      const successfulOff = harness();
+      await successfulOff.command("end-turn 70000");
+      await successfulOff.command("end-turn-delay 1");
+      successfulOff.startRun();
+      successfulOff.turn(40_000);
+      successfulOff.turn(75_000, false);
+      await successfulOff.settle();
+      await successfulOff.command("end-turn off");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(successfulOff.ctx.compact).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses a percentage threshold and the configured compactor at settlement", async () => {
     const { pi, ctx, command, activeModel, alternateModel, startRun, turn, settle, completeCompact, compactModel } = harness();
     await command("compactor current");
@@ -429,21 +541,21 @@ describe("pi-ac lifecycle", () => {
 
   it("skips end-of-turn compaction for aborted or already-compacted runs", async () => {
     const aborted = harness();
-    aborted.command("end-turn 80%");
+    await aborted.command("end-turn 80%");
     aborted.startRun();
     aborted.turn(90_000, false, [], "aborted");
     await aborted.settle(true);
     expect(aborted.ctx.compact).not.toHaveBeenCalled();
 
     const failed = harness();
-    failed.command("end-turn 80%");
+    await failed.command("end-turn 80%");
     failed.startRun();
     failed.turn(90_000, false, [], "error");
     await failed.settle();
     expect(failed.ctx.compact).not.toHaveBeenCalled();
 
     const alreadyCompacted = harness();
-    alreadyCompacted.command("end-turn 80%");
+    await alreadyCompacted.command("end-turn 80%");
     alreadyCompacted.startRun();
     alreadyCompacted.turn(90_000, false);
     alreadyCompacted.noteCompaction();
@@ -451,8 +563,8 @@ describe("pi-ac lifecycle", () => {
     expect(alreadyCompacted.ctx.compact).not.toHaveBeenCalled();
 
     const compactedThenContinued = harness();
-    compactedThenContinued.command("end-turn 80%");
-    compactedThenContinued.command("end-turn-delay 0");
+    await compactedThenContinued.command("end-turn 80%");
+    await compactedThenContinued.command("end-turn-delay 0");
     compactedThenContinued.startRun();
     compactedThenContinued.turn(60_000, false);
     compactedThenContinued.noteCompaction();
@@ -463,7 +575,7 @@ describe("pi-ac lifecycle", () => {
     await settling;
 
     const queued = harness();
-    queued.command("end-turn 80%");
+    await queued.command("end-turn 80%");
     queued.ctx.hasPendingMessages.mockReturnValue(true);
     queued.startRun();
     queued.turn(90_000, false);
@@ -471,7 +583,7 @@ describe("pi-ac lifecycle", () => {
     expect(queued.ctx.compact).not.toHaveBeenCalled();
 
     const piDisabled = harness({ enabled: false });
-    piDisabled.command("end-turn 80%");
+    await piDisabled.command("end-turn 80%");
     piDisabled.startRun();
     piDisabled.turn(90_000, false);
     await piDisabled.settle();
@@ -480,35 +592,218 @@ describe("pi-ac lifecycle", () => {
 
   it("disables end-of-turn compaction with /ac disable", async () => {
     const { ctx, command, startRun, turn, settle } = harness();
-    command("end-turn 70%");
-    command("disable");
+    await command("end-turn 70%");
+    await command("disable");
     startRun();
     turn(80_000, false);
     await settle();
     expect(ctx.compact).not.toHaveBeenCalled();
   });
 
-  it("sets and restores the default adaptive threshold through /ac threshold", () => {
+  it("sets and restores the default adaptive threshold through /ac threshold", async () => {
     const { ctx, command, turn } = harness();
-    command("threshold 60");
+    await command("threshold 60");
     turn(40_000);
     turn(59_000);
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
-    command("threshold default");
-    command("status");
+    await command("threshold default");
+    await command("status");
     expect(String(ctx.ui.notify.mock.calls.at(-1)?.[0]))
       .toContain("adaptive target: 50% or 230K tokens (whichever is lower; ~50K)");
   });
 
-  it("toggles proactive compaction with /ac enable and disable", () => {
+  it("loads the saved adaptive threshold and uses it for compaction", async () => {
+    await saveAdaptiveThreshold(agentDir!, 65);
+    const below = harness();
+    await below.startSession();
+    below.turn(60_000);
+    expect(below.ctx.compact).not.toHaveBeenCalled();
+
+    const atThreshold = harness();
+    await atThreshold.startSession();
+    atThreshold.turn(65_000);
+    expect(atThreshold.ctx.compact).toHaveBeenCalledTimes(1);
+    atThreshold.completeCompact();
+  });
+
+  it("loads end-of-turn token and percentage thresholds for settlement", async () => {
+    await saveEndOfTurnThreshold(agentDir!, { unit: "tokens", value: 70_000 });
+    const absolute = harness();
+    await absolute.startSession();
+    await absolute.command("end-turn-delay 0");
+    absolute.startRun();
+    absolute.turn(40_000);
+    absolute.turn(75_000, false);
+    const absoluteSettling = absolute.settle();
+    expect(absolute.ctx.compact).toHaveBeenCalledTimes(1);
+    absolute.completeCompact();
+    await absoluteSettling;
+
+    await saveEndOfTurnThreshold(agentDir!, { unit: "percent", value: 75 });
+    const percentage = harness();
+    await percentage.startSession();
+    await percentage.command("end-turn-delay 0");
+    percentage.startRun();
+    percentage.turn(40_000);
+    percentage.turn(75_000, false);
+    const percentageSettling = percentage.settle();
+    expect(percentage.ctx.compact).toHaveBeenCalledTimes(1);
+    percentage.completeCompact();
+    await percentageSettling;
+  });
+
+  it("keeps the default end-of-turn minimum but not on custom 40%", async () => {
+    const builtIn = harness();
+    await builtIn.startSession();
+    await builtIn.command("end-turn-delay 0");
+    builtIn.startRun();
+    builtIn.turn(40_000);
+    builtIn.turn(75_000, false);
+    await builtIn.settle();
+    expect(builtIn.ctx.compact).not.toHaveBeenCalled();
+
+    await saveEndOfTurnThreshold(agentDir!, { unit: "percent", value: 40 });
+    const custom = harness();
+    await custom.startSession();
+    await custom.command("end-turn-delay 0");
+    custom.startRun();
+    custom.turn(40_000);
+    custom.turn(75_000, false);
+    const settling = custom.settle();
+    expect(custom.ctx.compact).toHaveBeenCalledTimes(1);
+    custom.completeCompact();
+    await settling;
+
+    const endTurnPath = path.join(agentDir!, "pi-ac", "end-turn.json");
+    await writeFile(endTurnPath, '{"version":2,"value":{"unit":"percent","value":40}}');
+    const invalid = harness();
+    await invalid.startSession();
+    await invalid.command("end-turn-delay 0");
+    invalid.startRun();
+    invalid.turn(40_000);
+    invalid.turn(75_000, false);
+    await invalid.settle();
+    expect(invalid.ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("loads each threshold independently when the other file is invalid", async () => {
+    const adaptivePath = path.join(agentDir!, "pi-ac", "threshold.json");
+    await mkdir(path.dirname(adaptivePath), { recursive: true });
+    await writeFile(adaptivePath, "invalid");
+    await saveEndOfTurnThreshold(agentDir!, { unit: "percent", value: 75 });
+
+    const { ctx, command, startSession } = harness({ noContextUsage: true });
+    await startSession();
+    await command("status");
+
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Could not load adaptive threshold");
+    expect(messages).toContain("end-of-turn compaction: 75% of context window");
+  });
+
+  it("falls back on one unreadable setting and still loads the other", async () => {
+    await saveEndOfTurnThreshold(agentDir!, { unit: "percent", value: 75 });
+    const failure = Object.assign(new Error("blocked"), { code: "EACCES" });
+    vi.spyOn(fs, "readFile").mockRejectedValueOnce(failure);
+
+    const { ctx, command, startSession } = harness({ noContextUsage: true });
+    await startSession();
+    await command("status");
+
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Could not load adaptive threshold");
+    expect(messages).toContain("adaptive target: 50%");
+    expect(messages).toContain("end-of-turn compaction: 75% of context window");
+  });
+
+  it("treats ENOTDIR as a startup error and uses complete defaults", async () => {
+    const blockedAgentDir = path.join(agentDir!, "not-a-directory");
+    await writeFile(blockedAgentDir, "block");
+    vi.stubEnv("PI_CODING_AGENT_DIR", blockedAgentDir);
+    const { ctx, command, startSession } = harness({ noContextUsage: true });
+
+    await startSession();
+    await command("status");
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("ENOTDIR");
+    expect(messages).toContain("adaptive target: 50%");
+    expect(messages).toContain("200K tokens or 40% of context window");
+  });
+
+  it("refuses to mutate a threshold file that became invalid after startup", async () => {
+    await saveAdaptiveThreshold(agentDir!, 65);
+    const { ctx, command, startSession } = harness({ noContextUsage: true });
+    await startSession();
+    const adaptivePath = path.join(agentDir!, "pi-ac", "threshold.json");
+    await writeFile(adaptivePath, "{broken");
+
+    await command("threshold 70");
+    await command("status");
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("repair this file manually");
+    expect(messages).toContain("adaptive target: 65%");
+    expect(await fs.readFile(adaptivePath, "utf8")).toBe("{broken");
+  });
+
+  it("keeps both active thresholds unchanged when saves fail", async () => {
+    const { ctx, command } = harness({ noContextUsage: true });
+    await command("threshold 65");
+    await command("end-turn 40%");
+    const failure = Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    vi.spyOn(fs, "open").mockRejectedValueOnce(failure).mockRejectedValueOnce(failure);
+
+    await command("threshold 80");
+    await command("end-turn 75%");
+    await command("status");
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Could not save adaptive threshold; active value is unchanged");
+    expect(messages).toContain("Could not save end-of-turn threshold; active value is unchanged");
+    expect(messages).toContain("adaptive target: 65%");
+    expect(messages).toContain("end-of-turn compaction: 40% of context window");
+    expect(messages).not.toContain("adaptive compaction target set to 80%");
+    expect(messages).not.toContain("threshold set to 75% of context window. Saved globally");
+  });
+
+  it("preserves active values and the default flag when default removal fails", async () => {
+    const { ctx, command } = harness({ noContextUsage: true });
+    await command("threshold 65");
+    await command("end-turn 40%");
+    const failure = Object.assign(new Error("unlink failed"), { code: "EIO" });
+    vi.spyOn(fs, "unlink").mockRejectedValueOnce(failure).mockRejectedValueOnce(failure);
+
+    await command("threshold default");
+    await command("end-turn default");
+    await command("status");
+    const messages = ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Could not save adaptive threshold; active value is unchanged");
+    expect(messages).toContain("Could not save end-of-turn threshold; active value is unchanged");
+    expect(messages).toContain("adaptive target: 65%");
+    expect(messages).toContain("end-of-turn compaction: 40% of context window");
+    expect(messages).not.toContain("saved override removed");
+  });
+
+  it("shows exactly one adaptive target when context usage is unknown", async () => {
+    await saveAdaptiveThreshold(agentDir!, 65);
+    const { ctx, command, startSession } = harness({ noContextUsage: true });
+    await startSession();
+    await command("status");
+
+    const adaptiveLines = String(ctx.ui.notify.mock.calls.at(-1)?.[0])
+      .split("\n")
+      .filter((line) => line.startsWith("adaptive target:"));
+    expect(adaptiveLines).toHaveLength(1);
+    expect(adaptiveLines[0]).toContain("adaptive target: 65%");
+  });
+
+  it("toggles proactive compaction with /ac enable and disable", async () => {
     const { ctx, command, turn } = harness();
-    command("disable");
+    await command("disable");
     turn(40_000);
     turn(80_000);
     expect(ctx.compact).not.toHaveBeenCalled();
 
-    command("enable");
+    await command("enable");
     turn(80_000);
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });

@@ -1,4 +1,4 @@
-import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createGrowthHistory,
@@ -14,6 +14,12 @@ import {
   shouldCompactAtEndOfTurn,
   type EndOfTurnThreshold,
 } from "./policy.ts";
+import {
+  loadAdaptiveThreshold,
+  loadEndOfTurnThreshold,
+  saveAdaptiveThreshold,
+  saveEndOfTurnThreshold,
+} from "./threshold-config.ts";
 
 const RESUME_PROMPT = "Continue the current task from the compacted context. Do not repeat completed work.";
 const AC_COMMANDS = [
@@ -109,7 +115,7 @@ export default function piAc(pi: ExtensionAPI): void {
   pi.registerCommand("ac", acCommand);
   pi.registerCommand("autocompact", acCommand);
 
-  pi.on("session_start", () => {
+  pi.on("session_start", async (_event, ctx) => {
     cancelEndOfTurnTimer();
     pendingCompaction?.resolve();
     pendingCompaction = undefined;
@@ -128,6 +134,23 @@ export default function piAc(pi: ExtensionAPI): void {
     agentRunActive = false;
     compactedAfterLastTurn = false;
     lastTurnOutcome = null;
+    try {
+      const savedTarget = await loadAdaptiveThreshold(getAgentDir());
+      if (savedTarget !== undefined) targetPercent = savedTarget;
+    } catch (error) {
+      report(ctx, `Could not load adaptive threshold; using the built-in default. ${errorMessage(error)}`, "warning");
+    }
+    try {
+      const savedEndOfTurn = await loadEndOfTurnThreshold(getAgentDir());
+      if (savedEndOfTurn !== undefined) {
+        endOfTurnThreshold = savedEndOfTurn;
+        endOfTurnUsesDefault = false;
+      }
+    } catch (error) {
+      endOfTurnThreshold = { ...DEFAULT_END_OF_TURN_THRESHOLD };
+      endOfTurnUsesDefault = true;
+      report(ctx, `Could not load end-of-turn threshold; using the built-in default. ${errorMessage(error)}`, "warning");
+    }
   });
 
   pi.on("session_shutdown", () => {
@@ -247,10 +270,10 @@ export default function piAc(pi: ExtensionAPI): void {
         showStatus(ctx);
         return;
       case "threshold":
-        setThreshold(ctx, value);
+        await setThreshold(ctx, value);
         return;
       case "end-turn":
-        setEndOfTurnThreshold(ctx, value);
+        await setEndOfTurnThreshold(ctx, value);
         return;
       case "end-turn-delay":
         setEndOfTurnDelay(ctx, value);
@@ -282,55 +305,82 @@ export default function piAc(pi: ExtensionAPI): void {
     }
   }
 
-  function setThreshold(ctx: ExtensionCommandContext, value: string): void {
+  async function setThreshold(ctx: ExtensionCommandContext, value: string): Promise<void> {
     if (!value) {
       showStatus(ctx);
       return;
     }
+    let nextValue: number | null;
+    let savedValue: number | null | undefined;
+    let successMessage: string;
     if (/^default$/i.test(value)) {
-      targetPercent = DEFAULT_TARGET_PERCENT;
-      report(ctx, "Adaptive target reset to 50% or 230,000 tokens, whichever is lower.");
+      nextValue = DEFAULT_TARGET_PERCENT;
+      savedValue = undefined;
+      successMessage = "Adaptive target reset to the built-in default; saved override removed for this and future sessions.";
+    } else if (/^(off|null|none)$/i.test(value)) {
+      nextValue = null;
+      savedValue = null;
+      successMessage = "Adaptive percentage target disabled; growth forecasting still uses Pi's threshold. Saved globally for future sessions.";
+    } else {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+        report(ctx, "Usage: /ac threshold <default|1-100|off>", "warning");
+        return;
+      }
+      nextValue = parsed;
+      savedValue = parsed;
+      successMessage = `Adaptive compaction target set to ${parsed}%, capped at 230,000 tokens. Saved globally for future sessions.`;
+    }
+
+    try {
+      await saveAdaptiveThreshold(getAgentDir(), savedValue);
+    } catch (error) {
+      report(ctx, `Could not save adaptive threshold; active value is unchanged. ${errorMessage(error)}`, "warning");
       return;
     }
-    if (/^(off|null|none)$/i.test(value)) {
-      targetPercent = null;
-      report(ctx, "Adaptive percentage target disabled for this session; growth forecasting still uses Pi's threshold.");
-      return;
-    }
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
-      report(ctx, "Usage: /ac threshold <default|1-100|off>", "warning");
-      return;
-    }
-    targetPercent = parsed;
-    report(ctx, `Adaptive compaction target set to ${parsed}%, capped at 230,000 tokens, for this session.`);
+    targetPercent = nextValue;
+    report(ctx, successMessage);
   }
 
-  function setEndOfTurnThreshold(ctx: ExtensionCommandContext, value: string): void {
+  async function setEndOfTurnThreshold(ctx: ExtensionCommandContext, value: string): Promise<void> {
     if (!value) {
       showStatus(ctx);
       return;
     }
+
+    let nextValue: EndOfTurnThreshold | null;
+    let savedValue: EndOfTurnThreshold | null | undefined;
+    let usesDefault: boolean;
+    let successMessage: string;
     if (/^default$/i.test(value)) {
-      endOfTurnThreshold = { ...DEFAULT_END_OF_TURN_THRESHOLD };
-      endOfTurnUsesDefault = true;
-      report(ctx, "End-of-turn compaction reset to 200,000 tokens or 40%, whichever is higher.");
+      nextValue = { ...DEFAULT_END_OF_TURN_THRESHOLD };
+      savedValue = undefined;
+      usesDefault = true;
+      successMessage = "End-of-turn compaction reset to the built-in default; saved override removed for this and future sessions.";
+    } else {
+      const parsed = parseEndOfTurnThreshold(value);
+      if (parsed === undefined) {
+        report(ctx, "Usage: /ac end-turn <default|off|token-count|percent%>", "warning");
+        return;
+      }
+      nextValue = parsed;
+      savedValue = parsed;
+      usesDefault = false;
+      successMessage = parsed === null
+        ? "End-of-turn compaction disabled. Saved globally for future sessions."
+        : `End-of-turn compaction threshold set to ${formatEndOfTurnThreshold(parsed)}. Saved globally for future sessions.`;
+    }
+
+    try {
+      await saveEndOfTurnThreshold(getAgentDir(), savedValue);
+    } catch (error) {
+      report(ctx, `Could not save end-of-turn threshold; active value is unchanged. ${errorMessage(error)}`, "warning");
       return;
     }
-    const parsed = parseEndOfTurnThreshold(value);
-    if (parsed === undefined) {
-      report(ctx, "Usage: /ac end-turn <default|off|token-count|percent%>", "warning");
-      return;
-    }
-    endOfTurnThreshold = parsed;
-    endOfTurnUsesDefault = false;
-    if (parsed === null) cancelEndOfTurnTimer();
-    report(
-      ctx,
-      parsed === null
-        ? "End-of-turn compaction disabled for this session."
-        : `End-of-turn compaction threshold set to ${formatEndOfTurnThreshold(parsed)} for this session.`,
-    );
+    endOfTurnThreshold = nextValue;
+    endOfTurnUsesDefault = usesDefault;
+    if (nextValue === null) cancelEndOfTurnTimer();
+    report(ctx, successMessage);
   }
 
   function setEndOfTurnDelay(ctx: ExtensionCommandContext, value: string): void {
@@ -545,14 +595,16 @@ export default function piAc(pi: ExtensionAPI): void {
       "/autocompact              Alias for /ac",
       "/ac compact [focus]       Compact now; resume interrupted work",
       "/ac status                Show context and compaction settings",
-      "/ac threshold <default|1-100|off> Set adaptive target; off uses Pi's threshold",
-      "/ac end-turn <default|token-count|percent%|off> Set final-run threshold",
+      "/ac threshold <default|1-100|off> Set and save global adaptive target; off uses Pi's threshold",
+      "/ac end-turn <default|token-count|percent%|off> Set and save global final-run threshold",
       "/ac end-turn-delay <minutes>   Wait before final compaction; default 10, 0 is immediate",
       "/ac compactor current    Save the active model for summaries",
       "/ac compactor clear      Use the active model for each summary",
       "/ac enable | disable     Toggle proactive compaction",
       "",
       "Defaults: adaptive min(230K, 50%); end-turn max(200K, 40%) after 10 minutes",
+      "Thresholds save globally; delay, enable state, and compactor model are session-only.",
+      "Other running Pi sessions do not update when a threshold changes.",
       "Examples: /ac threshold 80 · /ac end-turn 120000 · /ac end-turn-delay 5",
       "",
       "Current session:",
@@ -596,6 +648,8 @@ export default function piAc(pi: ExtensionAPI): void {
       );
       lines.push(`Pi threshold: ~${formatTokens(nativeThreshold)} · reserve ${formatTokens(policy.reserveTokens)}`);
       lines.push(`recent growth forecast: ~${formatTokens(estimateNextTurnGrowth(growth))}`);
+    } else {
+      lines.push(`adaptive target: ${targetPercent === null ? "Pi threshold" : `${targetPercent}% or ${formatTokens(DEFAULT_TARGET_TOKENS)} tokens (whichever is lower)`}`);
     }
     lines.push(`Pi auto-compaction: ${policy.enabled ? "enabled" : "disabled"}`);
     if (compacting) lines.push("compaction: running");
@@ -638,6 +692,10 @@ function getAcArgumentCompletions(prefix: string) {
 function report(ctx: ExtensionContext, message: string, type: "info" | "warning" = "info"): void {
   if (ctx.hasUI) ctx.ui.notify(message, type);
   else console.log(`[pi-ac] ${message}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sameModel(
