@@ -19,8 +19,8 @@ A Pi extension that starts native compaction early during long-running tasks. It
 | `/ac` or `/ac help` | Show help and current session status |
 | `/ac status` | Show usage, thresholds, compactor model, growth forecast, and last compaction |
 | `/ac compact [focus]` | Run Pi's compaction; resume an interrupted task |
-| `/ac threshold <default\|1-100\|off>` | Set this session's adaptive target; `default` restores 50%/230,000 tokens, `off` uses Pi's threshold |
-| `/ac end-turn <default\|off\|token-count\|percent%>` | Set the end-of-turn threshold; on by default at max(200,000 tokens, 40%) |
+| `/ac threshold <default\|1-100\|off>` | Set the global adaptive target; `default` restores 50%/230,000 tokens, `off` uses Pi's threshold |
+| `/ac end-turn <default\|off\|token-count\|percent%>` | Set the global end-of-turn threshold; on by default at max(200,000 tokens, 40%) |
 | `/ac end-turn-delay <minutes>` | Set this session's wait before end-of-turn compaction; default is 10, `0` is immediate |
 | `/ac compactor current` | Save the active `provider/model` as the compactor for this session |
 | `/ac compactor clear` | Clear the saved compactor and use the active model |
@@ -32,15 +32,28 @@ pi-ac does not prune messages or add a footer or statusline.
 
 ## Threshold behavior
 
-At each turn end, pi-ac adds its growth estimate to the current context size and compares the result with the lower of the percentage target, 230,000 tokens, and Pi's native threshold. The default percentage is 50%. The estimate uses the last five observed increases. `/ac threshold <1-100>` changes the percentage for this session; `default` restores 50%, and `off` uses Pi's threshold without the percentage or 230,000-token cap.
+At each turn end, pi-ac adds its growth estimate to the current context size and compares the result with the lower of the percentage target, 230,000 tokens, and Pi's native threshold. The default percentage is 50%. The estimate uses the last five observed increases. `/ac threshold <1-100>` changes the percentage and saves it globally; `default` restores 50%, and `off` uses Pi's threshold without the percentage or 230,000-token cap.
 
 ## End-of-turn compaction
 
-End-of-turn compaction is on by default. Its threshold is the higher of 200,000 tokens or 40% of the current model's context window. Set a custom absolute threshold, such as `/ac end-turn 120000`, or a percentage, such as `/ac end-turn 80%`. Use `/ac end-turn default` to restore the default, or `/ac end-turn off` to disable it.
+End-of-turn compaction is on by default. Its threshold is the higher of 200,000 tokens or 40% of the current model's context window. Set a custom absolute threshold, such as `/ac end-turn 120000`, or a percentage, such as `/ac end-turn 80%`. The value saves globally. Use `/ac end-turn default` to restore the default, or `/ac end-turn off` to disable it.
 
 After Pi settles a completed run, pi-ac waits ten minutes before compacting. Set another delay with `/ac end-turn-delay <minutes>`; `0` means no wait. The delay is session-only and resets to ten minutes in a new session.
 
 Pi has no native delay option. pi-ac uses a session timer and clears it when a new run starts, another compaction occurs, `/ac end-turn off` or `/ac disable` is used, or the session shuts down. When the timer fires, pi-ac rechecks the threshold, idle state, queued messages, and Pi's `compaction.enabled` setting. It skips aborted runs and runs that already compacted. End-of-turn compaction does not queue a continuation.
+
+## Threshold persistence
+
+`/ac threshold` and `/ac end-turn` save global overrides under the Pi agent directory:
+
+- `pi-ac/threshold.json` stores the adaptive threshold.
+- `pi-ac/end-turn.json` stores the end-of-turn threshold.
+
+The default agent directory is `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` to use another base directory. pi-ac loads each override when a session starts. A valid command saves the new value before it becomes active. `off` is saved as `null`; `default` removes only that setting's file.
+
+A missing file uses the built-in default. If a file is invalid or unreadable at startup, pi-ac warns and uses the complete built-in default for that setting. A failed save leaves the active value unchanged. pi-ac does not replace or delete an invalid file. Repair or remove the named file manually, then run the command again.
+
+Threshold changes do not update other running Pi sessions. The end-of-turn delay, enable state, and compactor model remain session-only.
 
 ## Compactor model
 
