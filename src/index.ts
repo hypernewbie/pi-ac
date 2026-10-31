@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -29,7 +32,7 @@ const AC_COMMANDS = [
   { name: "threshold", description: "Set the adaptive target" },
   { name: "end-turn", description: "Set the end-of-turn token threshold" },
   { name: "end-turn-delay", description: "Set the end-of-turn delay in minutes" },
-  { name: "compactor", description: "Save or clear the summary model" },
+  { name: "compactor", description: "Configure the summary model and thinking level" },
   { name: "enable", description: "Enable proactive compaction" },
   { name: "disable", description: "Disable proactive compaction" },
 ] as const;
@@ -58,8 +61,8 @@ const AC_ARGUMENTS: Record<string, { value: string; description: string }[]> = {
     { value: "10", description: "Wait 10 minutes (default)" },
   ],
   compactor: [
-    { value: "current", description: "Save the active model for summaries" },
-    { value: "clear", description: "Use the active model for summaries" },
+    { value: "current", description: "Save the active model and optionally set a level" },
+    { value: "clear", description: "Use the active model and thinking level" },
   ],
 };
 type CompactionSource = "automatic" | "command" | "end-of-turn" | "Pi";
@@ -74,6 +77,9 @@ interface ModelReference {
   id: string;
 }
 
+type ThinkingLevel = ReturnType<ExtensionAPI["getThinkingLevel"]>;
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 interface CompactionRequest {
   source: Exclude<CompactionSource, "Pi">;
   resume: boolean;
@@ -83,6 +89,7 @@ interface CompactionRequest {
 interface PendingCompaction {
   request: CompactionRequest;
   compactor: ModelReference;
+  compactorThinkingLevel: ThinkingLevel | null;
   originalModel: ExtensionContext["model"];
   thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>;
   resolve: () => void;
@@ -102,6 +109,8 @@ export default function piAc(pi: ExtensionAPI): void {
   let endOfTurnDelayMinutes = DEFAULT_END_OF_TURN_DELAY_MINUTES;
   let endOfTurnTimer: ReturnType<typeof setTimeout> | undefined;
   let compactorModel: ModelReference | null = null;
+  let compactorThinkingLevel: ThinkingLevel | null = null;
+  let compactorPersistedPath: string | undefined;
   let pendingCompaction: PendingCompaction | undefined;
   let agentRunActive = false;
   let compactedAfterLastTurn = false;
@@ -114,6 +123,14 @@ export default function piAc(pi: ExtensionAPI): void {
   };
   pi.registerCommand("ac", acCommand);
   pi.registerCommand("autocompact", acCommand);
+  pi.registerFlag("ac-compactor-model", {
+    description: "Model slug to use for pi-ac summaries",
+    type: "string",
+  });
+  pi.registerFlag("ac-compactor-thinking", {
+    description: "Thinking level to use for pi-ac summaries",
+    type: "string",
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     cancelEndOfTurnTimer();
@@ -131,6 +148,9 @@ export default function piAc(pi: ExtensionAPI): void {
     endOfTurnUsesDefault = true;
     endOfTurnDelayMinutes = DEFAULT_END_OF_TURN_DELAY_MINUTES;
     compactorModel = null;
+    compactorThinkingLevel = null;
+    compactorPersistedPath = undefined;
+    loadPersistedCompactor(ctx);
     agentRunActive = false;
     compactedAfterLastTurn = false;
     lastTurnOutcome = null;
@@ -150,6 +170,21 @@ export default function piAc(pi: ExtensionAPI): void {
       endOfTurnThreshold = { ...DEFAULT_END_OF_TURN_THRESHOLD };
       endOfTurnUsesDefault = true;
       report(ctx, `Could not load end-of-turn threshold; using the built-in default. ${errorMessage(error)}`, "warning");
+    }
+
+    const modelFlag = pi.getFlag("ac-compactor-model");
+    const thinkingFlag = pi.getFlag("ac-compactor-thinking");
+    if (typeof modelFlag === "string" || typeof thinkingFlag === "string") {
+      if (
+        (typeof modelFlag === "string" && !modelFlag.trim()) ||
+        (typeof thinkingFlag === "string" && !thinkingFlag.trim())
+      ) {
+        warnCompactorFallback(ctx, "Compactor CLI flags must have non-empty values.");
+      } else {
+        const target = typeof modelFlag === "string" ? modelFlag : "current";
+        const thinking = typeof thinkingFlag === "string" ? ` ${thinkingFlag}` : "";
+        setCompactor(ctx, `${target}${thinking}`, false);
+      }
     }
   });
 
@@ -185,6 +220,7 @@ export default function piAc(pi: ExtensionAPI): void {
           ctx,
           pending.request,
           pending.compactor,
+          pending.compactorThinkingLevel,
           pending.originalModel,
           pending.thinkingLevel,
         );
@@ -414,27 +450,144 @@ export default function piAc(pi: ExtensionAPI): void {
     }
   }
 
-  function setCompactor(ctx: ExtensionCommandContext, value: string): void {
-    const action = value.toLowerCase();
+  function warnCompactorFallback(ctx: ExtensionContext, reason: string): void {
+    compactorModel = null;
+    compactorThinkingLevel = null;
+    report(ctx, `WARNING: ${reason} Falling back to the active session model and thinking level.`, "warning");
+  }
+
+  function setCompactor(ctx: ExtensionContext, value: string, persist = true): void {
+    const [target = "", ...rest] = value.trim().split(/\s+/).filter(Boolean);
+    const action = target.toLowerCase();
     if (!action) {
       showStatus(ctx);
       return;
     }
+
     if (action === "clear") {
+      if (rest.length > 0) {
+        warnCompactorFallback(ctx, "Usage: /ac compactor <current|clear|provider/model> [thinking-level].");
+        return;
+      }
+      const path = compactorPersistedPath ?? findPersistedCompactorPath(ctx);
+      let persistenceError: unknown;
+      if (path) {
+        try {
+          unlinkSync(path);
+          compactorPersistedPath = undefined;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") compactorPersistedPath = undefined;
+          else persistenceError = error;
+        }
+      }
       compactorModel = null;
-      report(ctx, "Compactor cleared; compaction will use the active model.");
+      compactorThinkingLevel = null;
+      const detail = persistenceError instanceof Error ? ` Saved config could not be removed: ${persistenceError.message}` :
+        path ? ` Removed the saved ${getCompactorConfigScope(ctx, path)} setting.` : " No saved setting existed.";
+      report(
+        ctx,
+        `Compactor cleared for this session; compaction will use the active session model and thinking level.${detail}`,
+        persistenceError ? "warning" : "info",
+      );
       return;
     }
-    if (action !== "current") {
-      report(ctx, "Usage: /ac compactor <current|clear>", "warning");
+
+    const requestedThinkingLevel = rest.length === 1 ? parseThinkingLevel(rest[0]) : undefined;
+    if (rest.length > 1 || (rest.length === 1 && !requestedThinkingLevel)) {
+      warnCompactorFallback(
+        ctx,
+        "Invalid compactor thinking level. Use off, minimal, low, medium, high, xhigh, or max.",
+      );
       return;
     }
-    if (!ctx.model) {
-      report(ctx, "No active model is available to save as the compactor.", "warning");
+
+    if (action === "current") {
+      if (!ctx.model) {
+        warnCompactorFallback(ctx, "No active model is available to save as the compactor.");
+        return;
+      }
+      applyCompactor(ctx, { provider: ctx.model.provider, id: ctx.model.id }, requestedThinkingLevel ?? null, persist);
       return;
     }
-    compactorModel = { provider: ctx.model.provider, id: ctx.model.id };
-    report(ctx, `Compactor set to ${formatModelReference(compactorModel)} for this session.`);
+
+    const reference = parseModelReference(target);
+    const model = reference ? ctx.modelRegistry.find(reference.provider, reference.id) : undefined;
+    if (!reference || !model) {
+      warnCompactorFallback(ctx, `Compactor model slug "${target}" is invalid or unavailable.`);
+      return;
+    }
+
+    applyCompactor(ctx, reference, requestedThinkingLevel ?? null, persist);
+  }
+
+  function applyCompactor(
+    ctx: ExtensionContext,
+    model: ModelReference,
+    thinkingLevel: ThinkingLevel | null,
+    persist: boolean,
+  ): void {
+    compactorModel = model;
+    compactorThinkingLevel = thinkingLevel;
+    let message = `Compactor set to ${formatModelReference(model)} (thinking: ${thinkingLevel ?? "session level"})`;
+    let type: "info" | "warning" = "info";
+
+    if (!persist) {
+      message += " for this launch only; the saved config is unchanged.";
+    } else {
+      const projectPath = getProjectCompactorConfigPath(ctx);
+      const path = projectPath ?? getUserCompactorConfigPath();
+      try {
+        saveCompactorConfig(path, model, thinkingLevel);
+        compactorPersistedPath = path;
+        message += ` and saved to the ${getCompactorConfigScope(ctx, path)} config.`;
+      } catch (error) {
+        type = "warning";
+        message += ` for this session only; config could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    report(ctx, message, type);
+  }
+
+  function loadPersistedCompactor(ctx: ExtensionContext): void {
+    const path = findPersistedCompactorPath(ctx);
+    compactorPersistedPath = path;
+    if (!path) return;
+
+    try {
+      const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("expected a JSON object");
+      }
+      const config = value as Record<string, unknown>;
+      if (config.version !== 1 || typeof config.model !== "string") {
+        throw new Error("expected version 1 and a model slug");
+      }
+
+      const reference = parseModelReference(config.model);
+      const model = reference ? ctx.modelRegistry.find(reference.provider, reference.id) : undefined;
+      if (!reference || !model) {
+        warnCompactorFallback(ctx, `Saved compactor model slug "${config.model}" is invalid or unavailable.`);
+        return;
+      }
+
+      const thinking = config.thinking === undefined || config.thinking === null
+        ? null
+        : typeof config.thinking === "string"
+        ? parseThinkingLevel(config.thinking)
+        : undefined;
+      if (thinking === undefined) {
+        warnCompactorFallback(ctx, `Saved compactor thinking level "${String(config.thinking)}" is invalid.`);
+        return;
+      }
+
+      compactorModel = reference;
+      compactorThinkingLevel = thinking;
+    } catch (error) {
+      warnCompactorFallback(
+        ctx,
+        `Saved compactor config at ${path} is invalid (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
   }
 
   function isEndOfTurnCompactionReady(ctx: ExtensionContext): boolean {
@@ -487,6 +640,7 @@ export default function piAc(pi: ExtensionAPI): void {
     compactionWasAborted = false;
 
     const compactor = compactorModel ? { ...compactorModel } : null;
+    const compactorThinking = compactorThinkingLevel;
     const originalModel = ctx.model;
     const thinkingLevel = pi.getThinkingLevel();
     if (compactor && !originalModel) {
@@ -495,37 +649,88 @@ export default function piAc(pi: ExtensionAPI): void {
       return Promise.resolve();
     }
 
-    const needsSwitch = compactor !== null && !sameModel(originalModel, compactor);
-    if (needsSwitch && !ctx.isIdle()) {
+    const needsModelSwitch = compactor !== null && !sameModel(originalModel, compactor);
+    const needsThinkingSwitch =
+      compactor !== null && compactorThinking !== null && compactorThinking !== thinkingLevel;
+    if ((needsModelSwitch || needsThinkingSwitch) && !ctx.isIdle()) {
       // Stop the active run before changing models, then resume after compaction.
       return new Promise((resolve) => {
-        pendingCompaction = { request, compactor, originalModel, thinkingLevel, resolve };
+        pendingCompaction = {
+          request,
+          compactor,
+          compactorThinkingLevel: compactorThinking,
+          originalModel,
+          thinkingLevel,
+          resolve,
+        };
         ctx.abort();
       });
     }
 
-    return performCompaction(ctx, request, compactor, originalModel, thinkingLevel);
+    return performCompaction(ctx, request, compactor, compactorThinking, originalModel, thinkingLevel);
   }
 
   async function performCompaction(
     ctx: ExtensionContext,
     request: CompactionRequest,
     compactor: ModelReference | null,
+    compactorThinkingLevel: ThinkingLevel | null,
     originalModel: ExtensionContext["model"],
-    thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>,
+    thinkingLevel: ThinkingLevel,
   ): Promise<void> {
     let success = false;
     let canResume = true;
     let errorMessage: string | undefined;
 
+    async function restoreSessionModelAndThinking(): Promise<void> {
+      if (originalModel && !sameModel(ctx.model, originalModel)) {
+        const restored = await pi.setModel(originalModel);
+        if (!restored) throw new Error(`Could not restore ${originalModel.provider}/${originalModel.id}`);
+      }
+      if (pi.getThinkingLevel() !== thinkingLevel) pi.setThinkingLevel(thinkingLevel);
+    }
+
     try {
       if (compactor) {
         if (!originalModel) throw new Error("No active model to restore to.");
-        if (!sameModel(originalModel, compactor)) {
-          const model = ctx.modelRegistry.find(compactor.provider, compactor.id);
-          if (!model) throw new Error(`Compactor model not found: ${formatModelReference(compactor)}`);
-          const selected = await pi.setModel(model);
-          if (!selected) throw new Error(`Compactor model is not available: ${formatModelReference(compactor)}`);
+        const model = ctx.modelRegistry.find(compactor.provider, compactor.id);
+        if (!model) {
+          report(
+            ctx,
+            `WARNING: Compactor model ${formatModelReference(compactor)} is no longer available. Falling back to the active session model and thinking level.`,
+            "warning",
+          );
+        } else {
+          let selected = sameModel(originalModel, compactor);
+          let selectionError: unknown;
+          if (!selected) {
+            try {
+              selected = await pi.setModel(model);
+            } catch (error) {
+              selectionError = error;
+            }
+          }
+
+          if (!selected) {
+            await restoreSessionModelAndThinking();
+            const reason = selectionError instanceof Error ? `: ${selectionError.message}` : "";
+            report(
+              ctx,
+              `WARNING: Could not activate compactor model ${formatModelReference(compactor)}${reason}. Falling back to the active session model and thinking level.`,
+              "warning",
+            );
+          } else {
+            const requestedThinking = compactorThinkingLevel ?? thinkingLevel;
+            pi.setThinkingLevel(requestedThinking);
+            if (pi.getThinkingLevel() !== requestedThinking) {
+              await restoreSessionModelAndThinking();
+              report(
+                ctx,
+                `WARNING: Thinking level ${requestedThinking} is not supported by compactor model ${formatModelReference(compactor)}. Falling back to the active session model and thinking level.`,
+                "warning",
+              );
+            }
+          }
         }
       }
 
@@ -548,16 +753,12 @@ export default function piAc(pi: ExtensionAPI): void {
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
-      if (originalModel && !sameModel(ctx.model, originalModel)) {
-        try {
-          const restored = await pi.setModel(originalModel);
-          if (!restored) throw new Error(`Could not restore ${originalModel.provider}/${originalModel.id}`);
-          pi.setThinkingLevel(thinkingLevel);
-        } catch (error) {
-          canResume = false;
-          success = false;
-          errorMessage = error instanceof Error ? error.message : String(error);
-        }
+      try {
+        await restoreSessionModelAndThinking();
+      } catch (error) {
+        canResume = false;
+        success = false;
+        errorMessage = error instanceof Error ? error.message : String(error);
       }
 
       if (errorMessage && !compactionWasAborted) report(ctx, `Compaction failed: ${errorMessage}`, "warning");
@@ -598,8 +799,11 @@ export default function piAc(pi: ExtensionAPI): void {
       "/ac threshold <default|1-100|off> Set and save global adaptive target; off uses Pi's threshold",
       "/ac end-turn <default|token-count|percent%|off> Set and save global final-run threshold",
       "/ac end-turn-delay <minutes>   Wait before final compaction; default 10, 0 is immediate",
-      "/ac compactor current    Save the active model for summaries",
-      "/ac compactor clear      Use the active model for each summary",
+      "/ac compactor <provider/model> [thinking] Set and save the summary model and optional thinking level",
+      "/ac compactor current [thinking] Save the active model for summaries",
+      "/ac compactor clear      Clear the saved override and use the active session model",
+      "Project .pi/pi-ac.json overrides the user-wide config; CLI flags override both for this launch.",
+      "Startup flags: --ac-compactor-model provider/model --ac-compactor-thinking high",
       "/ac enable | disable     Toggle proactive compaction",
       "",
       "Defaults: adaptive min(230K, 50%); end-turn max(200K, 40%) after 10 minutes",
@@ -614,7 +818,7 @@ export default function piAc(pi: ExtensionAPI): void {
     report(ctx, lines.join("\n"), warning ? "warning" : "info");
   }
 
-  function showStatus(ctx: ExtensionCommandContext): void {
+  function showStatus(ctx: ExtensionContext): void {
     report(ctx, getStatusLines(ctx).join("\n"));
   }
 
@@ -632,6 +836,7 @@ export default function piAc(pi: ExtensionAPI): void {
     )}`);
     lines.push(`end-of-turn delay: ${formatEndOfTurnDelay(endOfTurnDelayMinutes)}`);
     lines.push(`compactor model: ${compactorModel ? formatModelReference(compactorModel) : "active model (no switch)"}`);
+    lines.push(`compactor thinking: ${compactorThinkingLevel ?? "active session level"}`);
     if (usage && usage.contextWindow > 0) {
       const nativeThreshold = Math.max(0, usage.contextWindow - policy.reserveTokens);
       const adaptiveThreshold = targetPercent === null
@@ -657,6 +862,53 @@ export default function piAc(pi: ExtensionAPI): void {
       lines.push(`last compaction: ${lastCompaction.source} · ~${formatTokens(lastCompaction.tokensBefore)} before`);
     }
     return lines;
+  }
+}
+
+function getProjectCompactorConfigPath(ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): string | undefined {
+  if (!ctx.isProjectTrusted()) return undefined;
+  const projectConfigDir = join(ctx.cwd, ".pi");
+  try {
+    if (!statSync(projectConfigDir).isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
+  return join(projectConfigDir, "pi-ac.json");
+}
+
+function getUserCompactorConfigPath(): string {
+  return join(getAgentDir(), "pi-ac.json");
+}
+
+function findPersistedCompactorPath(ctx: ExtensionContext): string | undefined {
+  const projectPath = getProjectCompactorConfigPath(ctx);
+  if (projectPath && existsSync(projectPath)) return projectPath;
+  const userPath = getUserCompactorConfigPath();
+  return existsSync(userPath) ? userPath : undefined;
+}
+
+function getCompactorConfigScope(ctx: ExtensionContext, path: string): string {
+  return path === getProjectCompactorConfigPath(ctx) ? "project .pi/pi-ac.json" : "user-wide";
+}
+
+function saveCompactorConfig(path: string, model: ModelReference, thinking: ThinkingLevel | null): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const config = {
+    version: 1,
+    model: formatModelReference(model),
+    ...(thinking ? { thinking } : {}),
+  };
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The temporary file may not have been created or may already be gone.
+    }
+    throw error;
   }
 }
 
@@ -691,11 +943,23 @@ function getAcArgumentCompletions(prefix: string) {
 
 function report(ctx: ExtensionContext, message: string, type: "info" | "warning" = "info"): void {
   if (ctx.hasUI) ctx.ui.notify(message, type);
+  else if (type === "warning") console.warn(`[pi-ac] ${message}`);
   else console.log(`[pi-ac] ${message}`);
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function parseModelReference(value: string): ModelReference | undefined {
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1 || /\s/.test(value)) return undefined;
+  return { provider: value.slice(0, separator), id: value.slice(separator + 1) };
+}
+
+function parseThinkingLevel(value: string): ThinkingLevel | undefined {
+  const normalized = value.toLowerCase();
+  return THINKING_LEVELS.find((level) => level === normalized);
 }
 
 function sameModel(
