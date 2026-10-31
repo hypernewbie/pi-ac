@@ -17,13 +17,14 @@ A Pi extension that starts native compaction early during long-running tasks. It
 | Command | Action |
 |---|---|
 | `/ac`, `/ac help`, or `/autocompact` | Show help and current session status |
-| `/ac status` | Show usage, thresholds, compactor model, growth forecast, and last compaction |
+| `/ac status` | Show usage, thresholds, compactor model and thinking level, growth forecast, and last compaction |
 | `/ac compact [focus]` | Run Pi's compaction; resume an interrupted task |
 | `/ac threshold <default\|1-100\|off>` | Set the global adaptive target; `default` restores 50%/230,000 tokens, `off` uses Pi's threshold |
 | `/ac end-turn <default\|off\|token-count\|percent%>` | Set the global end-of-turn threshold; on by default at max(200,000 tokens, 40%) |
 | `/ac end-turn-delay <minutes>` | Set this session's wait before end-of-turn compaction; default is 10, `0` is immediate |
-| `/ac compactor current` | Save the active `provider/model` as the compactor for this session |
-| `/ac compactor clear` | Clear the saved compactor and use the active model |
+| `/ac compactor <provider/model> [thinking]` | Set and save a compactor model slug and optional thinking level |
+| `/ac compactor current [thinking]` | Save the active model, with an optional thinking level |
+| `/ac compactor clear` | Clear the saved override and use the active model and thinking level |
 | `/ac enable` / `/ac disable` | Enable or disable proactive compaction for this session |
 
 The `/autocompact` command is an alias for `/ac` and accepts the same subcommands.
@@ -55,11 +56,27 @@ The default agent directory is `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` to use a
 
 A missing file uses the built-in default. If a file is invalid or unreadable at startup, pi-ac warns and uses the complete built-in default for that setting. A failed save leaves the active value unchanged. pi-ac does not replace or delete an invalid file. Repair or remove the named file manually, then run the command again.
 
-Threshold changes do not update other running Pi sessions. The end-of-turn delay, enable state, and compactor model remain session-only.
+Threshold changes do not update other running Pi sessions. The end-of-turn delay and enable state remain session-only.
 
 ## Compactor model
 
-By default, pi-ac does not switch models. `/ac compactor current` saves the active `provider/model` slug for this session. When pi-ac compacts, it switches to that model for Pi's summary, then restores the model and thinking level that were active before compaction. This applies to `/ac compact`, adaptive compaction, and end-of-turn compaction. Use `/ac compactor clear` to return to the active-model behavior. The saved model resets when a new session starts.
+By default, pi-ac uses the active model and thinking level. Set a separate summary model with `/ac compactor provider/model-id high`; the provider is the part before the first slash, and the remaining text is the model ID. Thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. If omitted, pi-ac uses the active session's thinking level. You can also set startup defaults with `pi --ac-compactor-model provider/model-id --ac-compactor-thinking high`. If only the thinking flag is set, pi-ac uses the active model.
+
+Slash commands save the setting in the trusted project's `.pi/pi-ac.json` when that `.pi/` directory exists. Otherwise, they save it user-wide in `pi-ac.json` under Pi's agent directory (normally `~/.pi/agent/`). Project config takes precedence over user config; if no project config exists, pi-ac reads the user config. CLI flags override saved settings for that launch and do not change either file. `/ac compactor clear` removes the saved config currently in use; clearing a project override allows the user config to apply in the next session.
+
+Saved compactor files use this format:
+
+```json
+{
+  "version": 1,
+  "model": "provider/model-id",
+  "thinking": "high"
+}
+```
+
+Omit `thinking` to use the session's level. Failed saves and clears leave the active setting unchanged. pi-ac does not overwrite or remove malformed files or files with an unsupported version; repair or remove the named file manually. Other running sessions keep their existing settings until a new session starts.
+
+The setting applies to manual, adaptive, and end-of-turn compaction. After a summary, pi-ac restores the model and thinking level that were active before compaction. An invalid or unavailable saved model or thinking level warns and falls back to the active session model and level. If a configured model cannot be activated, or does not support the requested level, pi-ac warns and still compacts with the active session model and level. Use `/ac compactor current [thinking]` to save the current model explicitly, or `/ac compactor clear` to remove the active persisted override.
 
 Pi settings control the native threshold and how much history it keeps:
 
