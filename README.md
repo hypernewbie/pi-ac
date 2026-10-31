@@ -64,6 +64,18 @@ By default, pi-ac uses the active model and thinking level. Set a separate summa
 
 Slash commands save the setting in the trusted project's `.pi/pi-ac.json` when that `.pi/` directory exists. Otherwise, they save it user-wide in `pi-ac.json` under Pi's agent directory (normally `~/.pi/agent/`). Project config takes precedence over user config; if no project config exists, pi-ac reads the user config. CLI flags override saved settings for that launch and do not change either file. `/ac compactor clear` removes the saved config currently in use; clearing a project override allows the user config to apply in the next session.
 
+Saved compactor files use this format:
+
+```json
+{
+  "version": 1,
+  "model": "provider/model-id",
+  "thinking": "high"
+}
+```
+
+Omit `thinking` to use the session's level. Failed saves and clears leave the active setting unchanged. pi-ac does not overwrite or remove malformed files or files with an unsupported version; repair or remove the named file manually. Other running sessions keep their existing settings until a new session starts.
+
 The setting applies to manual, adaptive, and end-of-turn compaction. After a summary, pi-ac restores the model and thinking level that were active before compaction. An invalid or unavailable saved model or thinking level warns and falls back to the active session model and level. If a configured model cannot be activated, or does not support the requested level, pi-ac warns and still compacts with the active session model and level. Use `/ac compactor current [thinking]` to save the current model explicitly, or `/ac compactor clear` to remove the active persisted override.
 
 Pi settings control the native threshold and how much history it keeps:

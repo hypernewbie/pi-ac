@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
 import { dirname, join } from "node:path";
 import { DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -91,7 +91,7 @@ interface PendingCompaction {
   compactor: ModelReference;
   compactorThinkingLevel: ThinkingLevel | null;
   originalModel: ExtensionContext["model"];
-  thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>;
+  thinkingLevel: ThinkingLevel;
   resolve: () => void;
 }
 
@@ -111,6 +111,7 @@ export default function piAc(pi: ExtensionAPI): void {
   let compactorModel: ModelReference | null = null;
   let compactorThinkingLevel: ThinkingLevel | null = null;
   let compactorPersistedPath: string | undefined;
+  let sessionGeneration = 0;
   let pendingCompaction: PendingCompaction | undefined;
   let agentRunActive = false;
   let compactedAfterLastTurn = false;
@@ -133,6 +134,7 @@ export default function piAc(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionGeneration++;
     cancelEndOfTurnTimer();
     pendingCompaction?.resolve();
     pendingCompaction = undefined;
@@ -180,6 +182,10 @@ export default function piAc(pi: ExtensionAPI): void {
         (typeof thinkingFlag === "string" && !thinkingFlag.trim())
       ) {
         warnCompactorFallback(ctx, "Compactor CLI flags must have non-empty values.");
+      } else if (typeof modelFlag === "string" && !parseModelReference(modelFlag)) {
+        warnCompactorFallback(ctx, `Compactor model slug "${modelFlag}" is invalid; expected provider/model.`);
+      } else if (typeof thinkingFlag === "string" && !parseThinkingLevel(thinkingFlag)) {
+        warnCompactorFallback(ctx, "Invalid compactor thinking level in CLI flags.");
       } else {
         const target = typeof modelFlag === "string" ? modelFlag : "current";
         const thinking = typeof thinkingFlag === "string" ? ` ${thinkingFlag}` : "";
@@ -189,7 +195,10 @@ export default function piAc(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    sessionGeneration++;
     cancelEndOfTurnTimer();
+    pendingCompaction?.resolve();
+    pendingCompaction = undefined;
   });
 
   pi.on("agent_start", () => {
@@ -469,26 +478,27 @@ export default function piAc(pi: ExtensionAPI): void {
         warnCompactorFallback(ctx, "Usage: /ac compactor <current|clear|provider/model> [thinking-level].");
         return;
       }
-      const path = compactorPersistedPath ?? findPersistedCompactorPath(ctx);
+      let path: string | undefined;
       let persistenceError: unknown;
-      if (path) {
-        try {
-          unlinkSync(path);
-          compactorPersistedPath = undefined;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") compactorPersistedPath = undefined;
-          else persistenceError = error;
+      try {
+        path = compactorPersistedPath ?? findPersistedCompactorPath(ctx);
+        if (path) {
+          readCompactorConfig(path);
+          fs.unlinkSync(path);
         }
+        compactorPersistedPath = undefined;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") compactorPersistedPath = undefined;
+        else persistenceError = error;
+      }
+      if (persistenceError) {
+        report(ctx, `Could not clear saved compactor; active value is unchanged. ${errorMessage(persistenceError)}`, "warning");
+        return;
       }
       compactorModel = null;
       compactorThinkingLevel = null;
-      const detail = persistenceError instanceof Error ? ` Saved config could not be removed: ${persistenceError.message}` :
-        path ? ` Removed the saved ${getCompactorConfigScope(ctx, path)} setting.` : " No saved setting existed.";
-      report(
-        ctx,
-        `Compactor cleared for this session; compaction will use the active session model and thinking level.${detail}`,
-        persistenceError ? "warning" : "info",
-      );
+      const detail = path ? ` Removed the saved setting at ${path}.` : " No saved setting existed.";
+      report(ctx, `Compactor cleared; compaction will use the active session model and thinking level.${detail}`);
       return;
     }
 
@@ -526,43 +536,34 @@ export default function piAc(pi: ExtensionAPI): void {
     thinkingLevel: ThinkingLevel | null,
     persist: boolean,
   ): void {
-    compactorModel = model;
-    compactorThinkingLevel = thinkingLevel;
     let message = `Compactor set to ${formatModelReference(model)} (thinking: ${thinkingLevel ?? "session level"})`;
-    let type: "info" | "warning" = "info";
 
     if (!persist) {
       message += " for this launch only; the saved config is unchanged.";
     } else {
-      const projectPath = getProjectCompactorConfigPath(ctx);
-      const path = projectPath ?? getUserCompactorConfigPath();
       try {
+        const path = getProjectCompactorConfigPath(ctx) ?? getUserCompactorConfigPath();
         saveCompactorConfig(path, model, thinkingLevel);
         compactorPersistedPath = path;
-        message += ` and saved to the ${getCompactorConfigScope(ctx, path)} config.`;
+        message += ` and saved to ${path}.`;
       } catch (error) {
-        type = "warning";
-        message += ` for this session only; config could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+        report(ctx, `Could not save compactor; active value is unchanged. ${errorMessage(error)}`, "warning");
+        return;
       }
     }
-    report(ctx, message, type);
+    compactorModel = model;
+    compactorThinkingLevel = thinkingLevel;
+    report(ctx, message);
   }
 
   function loadPersistedCompactor(ctx: ExtensionContext): void {
-    const path = findPersistedCompactorPath(ctx);
-    compactorPersistedPath = path;
-    if (!path) return;
-
+    let path: string | undefined;
     try {
-      const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("expected a JSON object");
-      }
-      const config = value as Record<string, unknown>;
-      if (config.version !== 1 || typeof config.model !== "string") {
-        throw new Error("expected version 1 and a model slug");
-      }
-
+      path = findPersistedCompactorPath(ctx);
+      compactorPersistedPath = path;
+      if (!path) return;
+      const config = readCompactorConfig(path);
+      if (!config) return;
       const reference = parseModelReference(config.model);
       const model = reference ? ctx.modelRegistry.find(reference.provider, reference.id) : undefined;
       if (!reference || !model) {
@@ -570,22 +571,12 @@ export default function piAc(pi: ExtensionAPI): void {
         return;
       }
 
-      const thinking = config.thinking === undefined || config.thinking === null
-        ? null
-        : typeof config.thinking === "string"
-        ? parseThinkingLevel(config.thinking)
-        : undefined;
-      if (thinking === undefined) {
-        warnCompactorFallback(ctx, `Saved compactor thinking level "${String(config.thinking)}" is invalid.`);
-        return;
-      }
-
       compactorModel = reference;
-      compactorThinkingLevel = thinking;
+      compactorThinkingLevel = config.thinking;
     } catch (error) {
       warnCompactorFallback(
         ctx,
-        `Saved compactor config at ${path} is invalid (${error instanceof Error ? error.message : String(error)}).`,
+        `Could not load saved compactor config${path ? ` at ${path}` : ""}: ${errorMessage(error)}.`,
       );
     }
   }
@@ -678,16 +669,20 @@ export default function piAc(pi: ExtensionAPI): void {
     originalModel: ExtensionContext["model"],
     thinkingLevel: ThinkingLevel,
   ): Promise<void> {
+    const generation = sessionGeneration;
     let success = false;
     let canResume = true;
     let errorMessage: string | undefined;
 
     async function restoreSessionModelAndThinking(): Promise<void> {
+      if (!compactor || generation !== sessionGeneration) return;
       if (originalModel && !sameModel(ctx.model, originalModel)) {
         const restored = await pi.setModel(originalModel);
         if (!restored) throw new Error(`Could not restore ${originalModel.provider}/${originalModel.id}`);
       }
+      if (generation !== sessionGeneration) return;
       if (pi.getThinkingLevel() !== thinkingLevel) pi.setThinkingLevel(thinkingLevel);
+      if (pi.getThinkingLevel() !== thinkingLevel) throw new Error(`Could not restore thinking level ${thinkingLevel}`);
     }
 
     try {
@@ -711,6 +706,7 @@ export default function piAc(pi: ExtensionAPI): void {
             }
           }
 
+          if (generation !== sessionGeneration) return;
           if (!selected) {
             await restoreSessionModelAndThinking();
             const reason = selectionError instanceof Error ? `: ${selectionError.message}` : "";
@@ -734,6 +730,7 @@ export default function piAc(pi: ExtensionAPI): void {
         }
       }
 
+      if (generation !== sessionGeneration) return;
       compactionSource = request.source;
       await new Promise<void>((resolve) => {
         let finished = false;
@@ -753,6 +750,7 @@ export default function piAc(pi: ExtensionAPI): void {
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
+      if (generation !== sessionGeneration) return;
       try {
         await restoreSessionModelAndThinking();
       } catch (error) {
@@ -761,6 +759,7 @@ export default function piAc(pi: ExtensionAPI): void {
         errorMessage = error instanceof Error ? error.message : String(error);
       }
 
+      if (generation !== sessionGeneration) return;
       if (errorMessage && !compactionWasAborted) report(ctx, `Compaction failed: ${errorMessage}`, "warning");
       finishCompaction(success, request, canResume);
     }
@@ -807,7 +806,7 @@ export default function piAc(pi: ExtensionAPI): void {
       "/ac enable | disable     Toggle proactive compaction",
       "",
       "Defaults: adaptive min(230K, 50%); end-turn max(200K, 40%) after 10 minutes",
-      "Thresholds save globally; delay, enable state, and compactor model are session-only.",
+      "Thresholds save globally; compactor settings save by scope. Delay and enable state are session-only.",
       "Other running Pi sessions do not update when a threshold changes.",
       "Examples: /ac threshold 80 · /ac end-turn 120000 · /ac end-turn-delay 5",
       "",
@@ -869,9 +868,10 @@ function getProjectCompactorConfigPath(ctx: Pick<ExtensionContext, "cwd" | "isPr
   if (!ctx.isProjectTrusted()) return undefined;
   const projectConfigDir = join(ctx.cwd, ".pi");
   try {
-    if (!statSync(projectConfigDir).isDirectory()) return undefined;
-  } catch {
-    return undefined;
+    if (!fs.statSync(projectConfigDir).isDirectory()) throw new Error(`${projectConfigDir} is not a directory`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
   return join(projectConfigDir, "pi-ac.json");
 }
@@ -882,33 +882,71 @@ function getUserCompactorConfigPath(): string {
 
 function findPersistedCompactorPath(ctx: ExtensionContext): string | undefined {
   const projectPath = getProjectCompactorConfigPath(ctx);
-  if (projectPath && existsSync(projectPath)) return projectPath;
-  const userPath = getUserCompactorConfigPath();
-  return existsSync(userPath) ? userPath : undefined;
+  for (const path of [projectPath, getUserCompactorConfigPath()]) {
+    if (!path) continue;
+    try {
+      fs.statSync(path);
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return undefined;
 }
 
-function getCompactorConfigScope(ctx: ExtensionContext, path: string): string {
-  return path === getProjectCompactorConfigPath(ctx) ? "project .pi/pi-ac.json" : "user-wide";
+function readCompactorConfig(path: string): { model: string; thinking: ThinkingLevel | null } | undefined {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  let config: unknown;
+  try {
+    config = JSON.parse(contents);
+  } catch {
+    throw new Error(`Invalid JSON in ${path}; repair or remove this file manually`);
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`Invalid compactor config at ${path}; repair or remove this file manually`);
+  }
+  const value = config as Record<string, unknown>;
+  const thinking = value.thinking === undefined || value.thinking === null
+    ? null
+    : typeof value.thinking === "string" ? parseThinkingLevel(value.thinking) : undefined;
+  if (value.version !== 1 || typeof value.model !== "string" || !parseModelReference(value.model) || thinking === undefined) {
+    throw new Error(`Invalid compactor config at ${path}; repair or remove this file manually`);
+  }
+  return { model: value.model, thinking };
 }
 
 function saveCompactorConfig(path: string, model: ModelReference, thinking: ThinkingLevel | null): void {
-  mkdirSync(dirname(path), { recursive: true });
+  readCompactorConfig(path);
+  fs.mkdirSync(dirname(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   const config = {
     version: 1,
     model: formatModelReference(model),
     ...(thinking ? { thinking } : {}),
   };
+  let descriptor: number | undefined;
+  let ownsTemporaryFile = false;
   try {
-    writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, path);
-  } catch (error) {
-    try {
-      unlinkSync(temporaryPath);
-    } catch {
-      // The temporary file may not have been created or may already be gone.
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    ownsTemporaryFile = true;
+    fs.writeFileSync(descriptor, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporaryPath, path);
+    ownsTemporaryFile = false;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* Preserve the write error. */ }
     }
-    throw error;
+    if (ownsTemporaryFile) {
+      try { fs.unlinkSync(temporaryPath); } catch { /* Preserve the write or rename error. */ }
+    }
   }
 }
 

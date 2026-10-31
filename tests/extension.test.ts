@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import fsSync, { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,7 +40,6 @@ function harness(options: {
   let tokens = 40_000;
   const contextWindow = options.contextWindow ?? 100_000;
   const cwd = options.cwd ?? join(testAgentDir, "project");
-  mkdirSync(cwd, { recursive: true });
   let compactOptions: any;
   let compactModel: any;
   let compactThinkingLevel: string | undefined;
@@ -78,6 +77,7 @@ function harness(options: {
     }),
     setModel: vi.fn(async (model: any) => {
       ctx.model = model;
+      thinkingLevel = model.supportedThinkingLevels?.[0] ?? "medium";
       return true;
     }),
     getThinkingLevel: () => thinkingLevel,
@@ -104,7 +104,7 @@ function harness(options: {
     }),
     hasUI: true,
     cwd,
-    isProjectTrusted: () => options.projectTrusted ?? true,
+    isProjectTrusted: vi.fn(() => options.projectTrusted ?? true),
     isIdle: vi.fn(() => true),
     hasPendingMessages: vi.fn(() => false),
     abort: vi.fn(),
@@ -344,6 +344,110 @@ describe("pi-ac lifecycle", () => {
     await compaction;
   });
 
+  it("validates CLI flags as values, never slash-command actions", async () => {
+    const configPath = join(testAgentDir, "pi-ac.json");
+    const original = JSON.stringify({ version: 1, model: "summary/fast/model", thinking: "low" });
+    writeFileSync(configPath, original);
+    for (const flags of [
+      { compactorModelFlag: "clear" },
+      { compactorModelFlag: "current" },
+      { compactorModelFlag: "summary/fast/model off" },
+      { compactorThinkingFlag: "low high" },
+      { compactorThinkingFlag: "" },
+      { compactorModelFlag: "" },
+    ]) {
+      const session = harness(flags);
+      await session.startSession();
+      await session.command("status");
+      expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
+      expect(session.ctx.ui.notify.mock.calls.some((call: unknown[]) => call[1] === "warning")).toBe(true);
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+    }
+
+    const thinkingOnly = harness({ compactorThinkingFlag: "off" });
+    await thinkingOnly.startSession();
+    await thinkingOnly.command("status");
+    const status = String(thinkingOnly.ctx.ui.notify.mock.calls.at(-1)?.[0]);
+    expect(status).toContain("compactor model: test/model");
+    expect(status).toContain("compactor thinking: off");
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+  });
+
+  it("preserves saved config and active selection when a write or clear fails", async () => {
+    const session = harness();
+    await session.command("compactor summary/fast/model low");
+    const configPath = join(testAgentDir, "pi-ac.json");
+    const original = readFileSync(configPath, "utf8");
+    const failure = Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    for (const operation of ["writeFileSync", "renameSync"] as const) {
+      vi.spyOn(fsSync, operation).mockImplementationOnce(() => { throw failure; });
+      await session.command("compactor current high");
+      await session.command("status");
+      expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: summary/fast/model");
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+      expect(await fs.readdir(testAgentDir)).toEqual(["pi-ac.json"]);
+    }
+
+    vi.spyOn(fsSync, "unlinkSync").mockImplementationOnce(() => { throw failure; });
+    await session.command("compactor clear");
+    await session.command("status");
+    expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: summary/fast/model");
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    const messages = session.ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(messages).toContain("Could not save compactor; active value is unchanged");
+    expect(messages).toContain("Could not clear saved compactor; active value is unchanged");
+  });
+
+  it("preserves malformed saved config and the active compactor on subsequent commands", async () => {
+    const session = harness();
+    await session.command("compactor summary/fast/model low");
+    const configPath = join(testAgentDir, "pi-ac.json");
+    const original = '{"version":2,"model":"test/model","newField":"preserve"}';
+    writeFileSync(configPath, original);
+    await session.command("compactor current");
+    await session.command("compactor clear");
+    await session.command("status");
+    expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: summary/fast/model");
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(session.ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n"))
+      .toContain("repair or remove this file manually");
+  });
+
+  it("does not touch an unowned temporary path after exclusive creation fails", async () => {
+    const session = harness();
+    await session.command("compactor summary/fast/model low");
+    let collisionPath = "";
+    vi.spyOn(fsSync, "openSync").mockImplementationOnce((path) => {
+      collisionPath = String(path);
+      writeFileSync(collisionPath, "not owned by this save");
+      throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+    });
+    await session.command("compactor current");
+    expect(readFileSync(collisionPath, "utf8")).toBe("not owned by this save");
+    expect(JSON.parse(readFileSync(join(testAgentDir, "pi-ac.json"), "utf8")))
+      .toEqual({ version: 1, model: "summary/fast/model", thinking: "low" });
+  });
+
+  it("does not redirect project storage errors to the user-wide config", async () => {
+    const session = harness();
+    const projectDir = join(session.cwd, ".pi");
+    mkdirSync(projectDir, { recursive: true });
+    const userPath = join(testAgentDir, "pi-ac.json");
+    const original = JSON.stringify({ version: 1, model: "summary/fast/model" });
+    writeFileSync(userPath, original);
+    const stat = fsSync.statSync;
+    vi.spyOn(fsSync, "statSync").mockImplementation(((path: string, ...args: any[]) => {
+      if (path === projectDir) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      return (stat as any)(path, ...args);
+    }) as typeof fsSync.statSync);
+    await session.startSession();
+    await session.command("compactor current");
+    await session.command("status");
+    expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
+    expect(readFileSync(userPath, "utf8")).toBe(original);
+    expect(session.ctx.ui.notify.mock.calls.some((call: unknown[]) => call[1] === "warning")).toBe(true);
+  });
+
   it("persists the active model across sessions and clears the saved config", async () => {
     const userConfigPath = join(testAgentDir, "pi-ac.json");
     const { ctx, command, activeModel, startSession } = harness();
@@ -408,22 +512,31 @@ describe("pi-ac lifecycle", () => {
     expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: summary/fast/model");
   });
 
-  it("warns and uses the active model when a project compactor config is unavailable", async () => {
+  it("warns on invalid project config without loading the user override or changing files", async () => {
     writeFileSync(join(testAgentDir, "pi-ac.json"), JSON.stringify({ version: 1, model: "summary/fast/model" }));
-    const session = harness();
-    const projectConfigDir = join(session.cwd, ".pi");
-    mkdirSync(projectConfigDir, { recursive: true });
-    writeFileSync(join(projectConfigDir, "pi-ac.json"), JSON.stringify({ version: 1, model: "missing/model" }));
-
-    await session.startSession();
-    await session.command("status");
-    expect(String(session.ctx.ui.notify.mock.calls.at(-1)?.[0])).toContain("compactor model: active model (no switch)");
-    expect(session.ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n"))
-      .toContain("WARNING: Saved compactor model slug \"missing/model\" is invalid or unavailable.");
+    const projectDir = join(testAgentDir, "project", ".pi");
+    mkdirSync(projectDir, { recursive: true });
+    const configPath = join(projectDir, "pi-ac.json");
+    for (const contents of [
+      "{broken", "[]", '{"version":2,"model":"test/model"}',
+      '{"version":1,"model":"missing/model"}',
+      '{"version":1,"model":"test/model","thinking":false}',
+      '{"version":1,"model":"test/model","thinking":"not-a-level"}',
+    ]) {
+      writeFileSync(configPath, contents);
+      const session = harness();
+      await session.startSession();
+      await session.command("status");
+      const status = String(session.ctx.ui.notify.mock.calls.at(-1)?.[0]);
+      expect(status).toContain("compactor model: active model (no switch)");
+      expect(status).toContain("compactor thinking: active session level");
+      expect(session.ctx.ui.notify.mock.calls.some((call: unknown[]) => call[1] === "warning")).toBe(true);
+      expect(readFileSync(configPath, "utf8")).toBe(contents);
+    }
   });
 
-  it("uses the active model after clearing the compactor", async () => {
-    const { pi, ctx, command, alternateModel, completeCompact, compactModel } = harness();
+  it("uses the active model after clear without overwriting later user selection", async () => {
+    const { pi, ctx, command, activeModel, alternateModel, completeCompact, compactModel, setSessionSelection, thinkingLevel } = harness();
     await command("compactor current");
     await command("compactor clear");
     ctx.model = alternateModel;
@@ -431,9 +544,12 @@ describe("pi-ac lifecycle", () => {
     const compaction = command("compact");
     await vi.waitFor(() => expect(ctx.compact).toHaveBeenCalledTimes(1));
     expect(compactModel()).toBe(alternateModel);
+    setSessionSelection(activeModel, "low");
     completeCompact();
     await compaction;
     expect(pi.setModel).not.toHaveBeenCalled();
+    expect(ctx.model).toBe(activeModel);
+    expect(thinkingLevel()).toBe("low");
   });
 
   it("falls back to the active model if the saved compactor cannot be selected", async () => {
@@ -461,7 +577,7 @@ describe("pi-ac lifecycle", () => {
     await compaction;
   });
 
-  it("persists end-of-turn threshold and resets other session controls", async () => {
+  it("persists thresholds and compactor but resets delay and enable state", async () => {
     const { ctx, command, startSession } = harness();
     await command("end-turn-delay 5");
     await command("end-turn 120000");
@@ -486,7 +602,7 @@ describe("pi-ac lifecycle", () => {
     expect(status).toContain("end-of-turn compaction: 120,000 tokens");
     expect(status).toContain("end-of-turn delay: 10 minutes");
     expect(status).toContain("automatic compaction enabled");
-    expect(status).toContain("compactor model: active model (no switch)");
+    expect(status).toContain("compactor model: test/model");
   });
 
   it("enables end-of-turn compaction by default at max(200K, 40%) after ten minutes", async () => {
@@ -786,6 +902,72 @@ describe("pi-ac lifecycle", () => {
     await settling;
     expect(thinkingLevel()).toBe("high");
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores selection after compactor failure and never retries cancelled work", async () => {
+    for (const aborted of [false, true]) {
+      const session = harness();
+      await session.command("compactor summary/fast/model low");
+      session.startRun();
+      const compaction = session.command("compact");
+      const settling = session.settle(true);
+      await vi.waitFor(() => expect(session.ctx.compact).toHaveBeenCalledTimes(1));
+      session.failCompact(aborted);
+      await settling;
+      await compaction;
+      expect(session.ctx.model).toBe(session.activeModel);
+      expect(session.thinkingLevel()).toBe("high");
+      expect(session.pi.sendUserMessage).toHaveBeenCalledTimes(aborted ? 0 : 1);
+      const switches = session.pi.setModel.mock.calls.length;
+      session.turn(70_000);
+      expect(session.pi.setModel).toHaveBeenCalledTimes(switches);
+      expect(session.ctx.compact).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("does not resume if the original model or thinking level cannot be restored", async () => {
+    for (const failure of ["model", "thinking"]) {
+      const session = harness();
+      await session.command("compactor summary/fast/model low");
+      session.startRun();
+      const compaction = session.command("compact");
+      const settling = session.settle(true);
+      await vi.waitFor(() => expect(session.ctx.compact).toHaveBeenCalledTimes(1));
+      if (failure === "model") session.pi.setModel.mockResolvedValueOnce(false);
+      else session.pi.setThinkingLevel.mockImplementation(() => {});
+      session.completeCompact();
+      await settling;
+      await compaction;
+      expect(session.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(session.ctx.ui.notify.mock.calls.map((call: unknown[]) => String(call[0])).join("\n"))
+        .toContain(failure === "model" ? "Could not restore test/model" : "Could not restore thinking level high");
+    }
+  });
+
+  it("ignores old compaction completions after shutdown and resolves deferred commands", async () => {
+    const session = harness();
+    await session.command("compactor summary/fast/model low");
+    session.startRun();
+    const deferred = session.command("compact");
+    session.shutdownSession();
+    await deferred;
+    await session.startSession();
+    await session.settle(true);
+    expect(session.ctx.compact).not.toHaveBeenCalled();
+
+    session.startRun();
+    const compaction = session.command("compact");
+    const settling = session.settle(true);
+    await vi.waitFor(() => expect(session.ctx.compact).toHaveBeenCalledTimes(1));
+    session.shutdownSession();
+    session.setSessionSelection(session.alternateModel, "medium");
+    await session.startSession();
+    session.completeCompact();
+    await settling;
+    await compaction;
+    expect(session.ctx.model).toBe(session.alternateModel);
+    expect(session.thinkingLevel()).toBe("medium");
+    expect(session.pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("uses the saved compactor for automatic compaction and resumes on the active model", async () => {
