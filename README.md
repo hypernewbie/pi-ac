@@ -33,6 +33,16 @@ Type `/ac ` to see command suggestions. Setting commands also suggest common val
 
 pi-ac does not prune messages or add a footer or statusline.
 
+## Session history tool
+
+pi-ac registers `ac_read_session` for the model. It recovers a specific fact from earlier raw history after compaction or in a long session. It reads from the active branch and cannot return a whole session at once.
+
+- `list` shows recent entry IDs with previews, newest first.
+- `search` finds entries that contain literal text, newest first.
+- `read` returns a narrow ID range in chronological order, with tool calls and results kept together.
+
+List or search first, then read a narrow range. Output is bounded at 8,000 tokens and notes when more remains, with a continuation ID.
+
 ## Threshold behavior
 
 At each turn end, pi-ac adds its growth estimate to the current context size and compares the result with the lower of the percentage target, 230,000 tokens, and Pi's native threshold. The default percentage is 50%. The estimate uses the last five observed increases. `/ac threshold <1-100>` changes the percentage and saves it globally; `default` restores 50%, and `off` uses Pi's threshold without the percentage or 230,000-token cap.

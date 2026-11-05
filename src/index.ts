@@ -23,6 +23,7 @@ import {
   saveAdaptiveThreshold,
   saveEndOfTurnThreshold,
 } from "./threshold-config.ts";
+import { registerSessionReaderTool } from "./session-reader-tool.ts";
 
 const RESUME_PROMPT = "Continue the current task from the compacted context. Do not repeat completed work.";
 const AC_COMMANDS = [
@@ -124,6 +125,7 @@ export default function piAc(pi: ExtensionAPI): void {
   };
   pi.registerCommand("ac", acCommand);
   pi.registerCommand("autocompact", acCommand);
+  registerSessionReaderTool(pi);
   pi.registerFlag("ac-compactor-model", {
     description: "Model slug to use for pi-ac summaries",
     type: "string",

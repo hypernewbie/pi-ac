@@ -37,6 +37,7 @@ function harness(options: {
   const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
   const commandHandlers: Record<string, (args: string, ctx: any) => unknown> = {};
   const commandCompletions: Record<string, (prefix: string) => any> = {};
+  const registeredTools: any[] = [];
   let tokens = 40_000;
   const contextWindow = options.contextWindow ?? 100_000;
   const cwd = options.cwd ?? join(testAgentDir, "project");
@@ -64,6 +65,9 @@ function harness(options: {
       commandHandlers[name] = command.handler;
       commandCompletions[name] = command.getArgumentCompletions;
     },
+    registerTool: vi.fn((tool: any) => {
+      registeredTools.push(tool);
+    }),
     registerFlag: vi.fn(),
     getFlag: (name: string) => flags[name],
     getSettings: () => ({
@@ -126,6 +130,7 @@ function harness(options: {
     pi,
     ctx,
     turn,
+    registeredTools,
     command: (args: string, name = "ac") => commandHandlers[name]?.(args, ctx),
     completeArgs: (prefix: string, name = "ac") => commandCompletions[name]?.(prefix) ?? null,
     activeModel,
@@ -306,6 +311,15 @@ describe("pi-ac lifecycle", () => {
       "compactor current",
       "compactor clear",
     ]);
+  });
+
+  it("registers ac_read_session for bounded raw history retrieval", () => {
+    const { registeredTools } = harness();
+    const names = registeredTools.map((tool) => tool.name);
+    expect(names).toEqual(["ac_read_session"]);
+    const tool = registeredTools[0];
+    expect(tool.executionMode).toBe("sequential");
+    expect(String(tool.description)).toMatch(/small, specific raw excerpt/i);
   });
 
   it("lets Pi CLI flags override saved compactor config without changing it", async () => {
